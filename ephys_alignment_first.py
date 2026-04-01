@@ -531,7 +531,8 @@ def detect_ephys_events(feature_traces, feature_times,
                         trial_rwd_times,
                         search_window=(-0.1, 0.5),
                         weights=None,
-                        min_confidence=0.3):
+                        min_confidence=0.3,
+                        min_candidates=2):
     """
     Per-trial event detector using one or multiple ephys feature traces.
 
@@ -617,22 +618,38 @@ def detect_ephys_events(feature_traces, feature_times,
 
         # Normalise confidence across candidates in this trial
         if scored:
+            n_cands = len(scored)
             cvals = np.array([c['confidence'] for c in scored])
             cmin, cmax = cvals.min(), cvals.max()
-            if cmax > cmin:
-                cvals_n = (cvals - cmin) / (cmax - cmin)
-            else:
-                cvals_n = np.ones(len(scored))
-            for i, c in enumerate(scored):
-                c['confidence_norm'] = float(cvals_n[i])
 
-            best_idx = int(np.argmax(cvals_n))
+            if n_cands < min_candidates:
+                # Too few candidates to trust within-trial normalisation.
+                # Use raw score scaled by a fixed reference (3 SD = strong signal).
+                # This prevents a single weak candidate from scoring 1.0.
+                for i, c in enumerate(scored):
+                    c['confidence_norm'] = float(min(1.0, max(0.0,
+                                                    c['confidence'] / 3.0)))
+                    c['n_candidates'] = n_cands
+            elif cmax > cmin:
+                cvals_n = (cvals - cmin) / (cmax - cmin)
+                for i, c in enumerate(scored):
+                    c['confidence_norm'] = float(cvals_n[i])
+                    c['n_candidates'] = n_cands
+            else:
+                for i, c in enumerate(scored):
+                    c['confidence_norm'] = 1.0
+                    c['n_candidates'] = n_cands
+
+            best_idx = int(np.argmax([c['confidence_norm'] for c in scored]))
             best = scored[best_idx]
-            if best['confidence_norm'] >= min_confidence:
+
+            # Reject if too few candidates OR score below threshold
+            if n_cands >= min_candidates and best['confidence_norm'] >= min_confidence:
                 events[tt] = {
                     'trial_idx': tt,
                     'time': best['time'],
                     'confidence': best['confidence_norm'],
+                    'n_candidates': n_cands,
                     'feature_scores': best['scores'],
                     'method': '+'.join(feat_names)
                 }
@@ -805,6 +822,7 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
                         min_conf=0.3,
                         ap_channels=None, lf_channels=None,
                         chunk_sec=60.0,
+                        min_candidates=2,
                         verbose=True):
     """
     Full ephys-to-behavior alignment for a single session.
@@ -873,7 +891,7 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
     feature_traces = {}
     feature_times  = {}
 
-    # --- AP band ---
+    # --- AP band — chunked loading (handles files >> 10 GB) ---
     if ap_bin is not None and Path(ap_bin).exists():
         if verbose:
             print(f"[AP] Reading {Path(ap_bin).name} …")
@@ -881,40 +899,100 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
             meta_ap = read_spikeglx_meta(ap_bin)
             n_ch_ap, sr_ap, n_samp_ap, uv_ap = parse_spikeglx_meta(meta_ap)
 
-            # Auto-select channels (first 64 by default for speed)
             if ap_channels is None:
                 ap_channels = list(range(min(64, n_ch_ap - 1)))
+
+            size_gb = len(ap_channels) * n_samp_ap * 2 / 1e9
             if verbose:
-                print(f"[AP] {n_ch_ap} ch, {sr_ap:.0f} Hz, "
-                      f"{n_samp_ap/sr_ap:.0f} s — using {len(ap_channels)} ch")
+                print(f"[AP] {n_ch_ap} ch total, {sr_ap:.0f} Hz, "
+                      f"{n_samp_ap/sr_ap/60:.1f} min — using {len(ap_channels)} ch "
+                      f"({size_gb:.1f} GB) — chunked @ {chunk_sec}s")
 
-            ap_data = load_ephys_chunk(ap_bin, 0, n_samp_ap,
-                                        channel_ids=ap_channels)
-            ap_data = (ap_data * uv_ap).astype(np.float32)
+            do_solenoid = 'solenoid_artifact' in feature_list
+            do_mua      = 'mua_envelope'      in feature_list
 
-            if 'solenoid_artifact' in feature_list:
+            chunk_samp   = int(chunk_sec * sr_ap)   # samples per core chunk
+            overlap_samp = int(0.5 * sr_ap)         # 0.5 s overlap for filter settling
+            ds_factor    = max(1, int(sr_ap / 1000.0))  # AP → 1 kHz for MUA
+
+            cm_chunks  = []   # solenoid common-mode (full SR)
+            mua_chunks = []   # MUA raw envelope (downsampled, z-score later)
+
+            n_chunks = int(np.ceil(n_samp_ap / chunk_samp))
+
+            for ci in range(n_chunks):
+                core_start = ci * chunk_samp
+                core_end   = min(n_samp_ap, core_start + chunk_samp)
+
+                load_start = max(0, core_start - overlap_samp)
+                load_end   = min(n_samp_ap, core_end + overlap_samp)
+
+                pre_pad  = core_start - load_start   # overlap samples before core
+                post_pad = load_end   - core_end      # overlap samples after core
+
                 if verbose:
-                    print("[FEAT] Extracting solenoid artifact …")
-                ev_samp, cm = extract_solenoid_artifact(ap_data, sr_ap)
-                t_art = np.arange(len(cm)) / sr_ap
-                cm_z  = (cm - np.nanmean(cm)) / max(np.nanstd(cm), 1e-9)
+                    pct = 100.0 * core_end / n_samp_ap
+                    print(f"[AP] chunk {ci+1}/{n_chunks}  "
+                          f"{core_start/sr_ap/60:.1f}–{core_end/sr_ap/60:.1f} min  "
+                          f"({pct:.0f}%)", end='\r', flush=True)
+
+                chunk = load_ephys_chunk(ap_bin, load_start, load_end,
+                                         channel_ids=ap_channels)
+                chunk = (chunk * uv_ap).astype(np.float32)
+
+                if do_solenoid:
+                    # Median across channels at each sample — no temporal filter,
+                    # so overlap is only needed for bookkeeping (trim it back).
+                    cm = np.median(chunk, axis=0).astype(np.float64)
+                    end_idx = len(cm) - post_pad if post_pad > 0 else None
+                    cm_chunks.append(cm[pre_pad:end_idx])
+
+                if do_mua:
+                    # extract_mua_envelope applies bandpass + medfilt internally.
+                    # We use the raw (non-z-scored) output and z-score after assembly.
+                    _, _, mua_raw_c = extract_mua_envelope(chunk, sr_ap)
+                    pre_ds  = pre_pad  // ds_factor
+                    post_ds = post_pad // ds_factor if post_pad > 0 else 0
+                    end_idx_ds = len(mua_raw_c) - post_ds if post_ds > 0 else None
+                    mua_chunks.append(mua_raw_c[pre_ds:end_idx_ds])
+
+                del chunk  # free memory immediately
+
+            if verbose:
+                print()  # newline after \r progress line
+
+            # --- Assemble solenoid feature from chunks ---
+            if do_solenoid:
+                cm_full = np.concatenate(cm_chunks)
+                abs_cm  = np.abs(cm_full)
+                mu, sd  = np.nanmean(abs_cm), np.nanstd(abs_cm)
+                cm_z    = (abs_cm - mu) / (sd if sd > 0 else 1.0)
+                t_art   = np.arange(len(cm_z)) / sr_ap
+                min_dist_samp = int(0.1 * sr_ap)
+                ev_samp, _ = find_peaks(cm_z, height=8.0,
+                                         distance=min_dist_samp)
                 feature_traces['solenoid_artifact'] = cm_z
                 feature_times['solenoid_artifact']  = t_art
                 if verbose:
                     print(f"[FEAT] solenoid: {len(ev_samp)} candidate events")
+                del cm_full, cm_chunks
 
-            if 'mua_envelope' in feature_list:
-                if verbose:
-                    print("[FEAT] Extracting MUA envelope …")
-                mua_t, mua_z, mua_raw = extract_mua_envelope(ap_data, sr_ap)
+            # --- Assemble MUA feature from chunks ---
+            if do_mua:
+                mua_full = np.concatenate(mua_chunks)
+                mu, sd   = np.nanmean(mua_full), np.nanstd(mua_full)
+                mua_z    = (mua_full - mu) / (sd if sd > 0 else 1.0)
+                sr_ds    = sr_ap / ds_factor
+                mua_t    = np.arange(len(mua_z)) / sr_ds
                 feature_traces['mua_envelope'] = mua_z
                 feature_times['mua_envelope']  = mua_t
                 if verbose:
-                    print(f"[FEAT] MUA: {len(mua_t)} samples "
-                          f"@ {sr_ap/max(1,int(sr_ap/1000)):.0f} Hz effective")
+                    print(f"[FEAT] MUA: {len(mua_t)} samples @ {sr_ds:.0f} Hz")
+                del mua_full, mua_chunks
 
         except Exception as e:
             warnings.warn(f"AP extraction failed: {e}")
+            import traceback; traceback.print_exc()
 
     # --- LF band ---
     if lf_bin is not None and Path(lf_bin).exists():
@@ -968,7 +1046,8 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
     events, all_candidates = detect_ephys_events(
         feature_traces, feature_times, trial_rwd_times,
         search_window=(-0.1, 0.5),   # 100 ms before → 500 ms after reward
-        min_confidence=min_conf)
+        min_confidence=min_conf,
+        min_candidates=min_candidates)
 
     detected_times = np.array(
         [e['time'] if e is not None else np.nan for e in events],
@@ -1138,6 +1217,16 @@ if __name__ == '__main__':
     parser.add_argument('--lf-channels', type=str, default=None,
                         help='Comma-separated LF channel indices')
 
+    # Memory / quality control
+    parser.add_argument('--chunk-sec', type=float, default=60.0,
+                        help='Seconds per AP chunk during loading (default 60). '
+                             'Reduce if RAM is tight; 60s @ 64ch ≈ 220 MB.')
+    parser.add_argument('--min-candidates', type=int, default=2,
+                        help='Minimum number of candidates per trial to trust '
+                             'confidence score. Trials with fewer candidates are '
+                             'rejected (confidence 1.0 from single candidate is '
+                             'uninformative). Default 2.')
+
     args = parser.parse_args()
 
     # Parse channel lists
@@ -1157,18 +1246,20 @@ if __name__ == '__main__':
 
     # Run
     session_res = process_one_session(
-        bhv_file     = args.bhv,
-        ap_bin       = args.ap,
-        lf_bin       = args.lf,
-        ks_folder    = args.ks,
-        out_folder   = args.out,
-        gt_sync_json = args.gt,
-        feature_list = feat_list,
-        make_sync    = args.make_sync,
-        train_frac   = args.train_frac,
-        min_conf     = args.min_conf,
-        ap_channels  = ap_ch,
-        lf_channels  = lf_ch,
+        bhv_file       = args.bhv,
+        ap_bin         = args.ap,
+        lf_bin         = args.lf,
+        ks_folder      = args.ks,
+        out_folder     = args.out,
+        gt_sync_json   = args.gt,
+        feature_list   = feat_list,
+        make_sync      = args.make_sync,
+        train_frac     = args.train_frac,
+        min_conf       = args.min_conf,
+        ap_channels    = ap_ch,
+        lf_channels    = lf_ch,
+        chunk_sec      = args.chunk_sec,
+        min_candidates = args.min_candidates,
     )
 
     if args.sweep:
