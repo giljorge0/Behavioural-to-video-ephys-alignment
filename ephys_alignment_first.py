@@ -1447,12 +1447,7 @@ if __name__ == '__main__':
                         help='Comma-separated LF channel indices (default: all)')
     # Hyperparameters for feature extraction and event detection
 
-    parser.add_argument('--chunk-sec', type=float, default=60.0,
-                        help='Seconds per AP loading chunk (default 60). '
-                             'Lower to 30 if RAM runs out.')
-    parser.add_argument('--min-candidates', type=int, default=2,
-                        help='Min candidates per trial to trust confidence '
-                             '(default 2). Single-candidate trials are rejected.')
+    
     parser.add_argument('--no-cache', action='store_true',
                         help='Ignore and overwrite any existing feature cache.')
 
