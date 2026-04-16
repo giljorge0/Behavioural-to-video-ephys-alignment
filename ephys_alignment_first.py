@@ -191,10 +191,20 @@ def write_sync_file(path, warp, events_map, metadata=None):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def read_spikeglx_meta(bin_path):
-    """Parse companion .meta file and return dict."""
-    meta_path = Path(bin_path).with_suffix('.meta')
+    """Parse companion .meta file and return dict.
+    Handles both file.ap.bin→file.ap.meta and file.ap→file.ap.meta naming.
+    """
+    bin_path = Path(bin_path)
+    # Case 1: file.ap.bin → file.ap.meta  (replace .bin suffix)
+    meta_path = bin_path.with_suffix('.meta')
     if not meta_path.exists():
-        raise FileNotFoundError(f"Meta file not found: {meta_path}")
+        # Case 2: file.ap → file.ap.meta  (append .meta)
+        meta_path = Path(str(bin_path) + '.meta')
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"Meta file not found. Tried:\n"
+            f"  {bin_path.with_suffix('.meta')}\n"
+            f"  {str(bin_path) + '.meta'}")
     meta = {}
     with open(meta_path, 'r') as f:
         for line in f:
@@ -277,6 +287,150 @@ def load_ephys_full(bin_path, channel_ids=None, dtype=np.int16,
     data = load_ephys_chunk(bin_path, 0, n_samples, channel_ids, dtype)
     return data, sr, uv_per_bit
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sync channel reader
+# Last channel (index n_ch-1, typically 384) is a digital TTL that toggles
+# on every behavior event.  Reading it gives direct behavior→ephys alignment
+# for sessions where it is present, and serves as ground truth to validate
+# the feature-based method.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def extract_sync_channel(ap_bin, bhv_df, sr_ap=None, sync_ch_idx=None,
+                         verbose=True):
+    """
+    Read the last channel from the AP bin, detect all TTL edges, match them
+    to behavior event times, and return GT ephys times for reward events.
+
+    The sync channel toggles 0↔1 on every behavior event logged in bhv_df.
+    We fit a linear warp (behavior_time → ephys_time) using ALL matched edges,
+    then return where each reward event (code==3) falls in ephys time.
+
+    Parameters
+    ----------
+    ap_bin     : path to AP .bin or .ap file
+    bhv_df     : DataFrame from load_behavior() — columns [timestamp, code]
+    sr_ap      : sample rate (read from meta if None)
+    sync_ch_idx: channel index of sync signal (None = last channel)
+
+    Returns
+    -------
+    gt_reward_ephys_times : array length n_rewards, ephys times of rewards
+    sync_edge_times_ephys : all edge times in ephys seconds (for diagnostics)
+    warp_sync             : warp dict from the sync-channel fit
+    """
+    meta = read_spikeglx_meta(ap_bin)
+    n_ch, sr, n_samp, _ = parse_spikeglx_meta(meta)
+    if sr_ap is None:
+        sr_ap = sr
+    if sync_ch_idx is None:
+        sync_ch_idx = n_ch - 1   # last channel = sync
+
+    if verbose:
+        print(f"[SYNC] Reading sync channel {sync_ch_idx} "
+              f"({n_samp/sr_ap/60:.1f} min @ {sr_ap:.0f} Hz) …")
+
+    # Load only the sync channel — 1 channel × n_samp × 2 bytes (manageable)
+    sync_raw = load_ephys_chunk(ap_bin, 0, n_samp,
+                                 channel_ids=[sync_ch_idx])[0]  # 1-D
+
+    # Detect edges: any sample where value changes
+    diff = np.diff(sync_raw.astype(np.int32))
+    edge_samples = np.where(diff != 0)[0] + 1   # +1: edge is at the new value
+    edge_times_ephys = edge_samples / sr_ap      # seconds in ephys clock
+
+    if verbose:
+        print(f"[SYNC] {len(edge_samples)} edges detected in sync channel")
+
+    # Get all behavior event times (same order as edges)
+    if bhv_df.shape[1] >= 2:
+        bhv_event_times = bhv_df['timestamp'].values.astype(float)
+        bhv_codes       = bhv_df.iloc[:, 1].values
+    else:
+        bhv_event_times = bhv_df['timestamp'].values.astype(float)
+        bhv_codes       = np.ones(len(bhv_event_times))
+
+    n_edges = len(edge_times_ephys)
+    n_events = len(bhv_event_times)
+
+    if n_edges == 0:
+        if verbose:
+            print("[SYNC] No edges found — sync channel is flat. "
+                  "Falling back to feature-based GT.")
+        n_rewards = int(np.sum(bhv_codes == 3))
+        return (np.full(n_rewards, np.nan),
+                np.array([]),
+                {'stretch': 1.0, 'offset': 0.0, 'rmse': np.nan, 'n': 0})
+
+    # Match edges to behavior events.
+    # Both sequences are ordered in time; trim whichever is longer.
+    n_match = min(n_edges, n_events)
+    if verbose and abs(n_edges - n_events) > 5:
+        print(f"[SYNC] Warning: {n_events} behavior events vs "
+              f"{n_edges} sync edges — using first {n_match} of each.")
+
+    bhv_t_match   = bhv_event_times[:n_match]
+    ephys_t_match = edge_times_ephys[:n_match]
+
+    # Fit warp using ALL matched events (much more data than reward-only)
+    warp_sync = fit_sync_warp(bhv_t_match, ephys_t_match,
+                               bounds=(0.9, 1.1),
+                               offset_bounds=(-300.0, 300.0))
+    if verbose:
+        print(f"[SYNC] Warp from sync channel: "
+              f"stretch={warp_sync['stretch']:.6f}  "
+              f"offset={warp_sync['offset']:.3f}s  "
+              f"rmse={warp_sync['rmse']:.5f}s  "
+              f"n={warp_sync['n']}")
+
+    # Compute GT ephys times for reward events specifically
+    reward_mask       = (bhv_codes == 3)
+    reward_bhv_times  = bhv_event_times[reward_mask]
+    gt_reward_ephys   = (warp_sync['stretch'] * reward_bhv_times
+                         + warp_sync['offset'])
+
+    return gt_reward_ephys, edge_times_ephys, warp_sync
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Feature cache  — save/load extracted traces so 105 GB is only read once
+# ──────────────────────────────────────────────────────────────────────────────
+
+def save_feature_cache(cache_path, feature_traces, feature_times,
+                       sync_edge_times=None, sr_ap=None, sr_lf=None):
+    """Save feature traces to .npz so re-runs skip the binary loading."""
+    payload = {}
+    for k, v in feature_traces.items():
+        payload[f'trace_{k}'] = np.asarray(v)
+    for k, v in feature_times.items():
+        payload[f'time_{k}']  = np.asarray(v)
+    if sync_edge_times is not None:
+        payload['sync_edge_times'] = np.asarray(sync_edge_times)
+    if sr_ap is not None:
+        payload['sr_ap'] = np.array([sr_ap])
+    if sr_lf is not None:
+        payload['sr_lf'] = np.array([sr_lf])
+    np.savez_compressed(str(cache_path), **payload)
+    return cache_path
+
+
+def load_feature_cache(cache_path):
+    """
+    Load cached feature traces.
+    Returns (feature_traces, feature_times, sync_edge_times, sr_ap, sr_lf).
+    """
+    d = np.load(str(cache_path), allow_pickle=False)
+    feature_traces = {}
+    feature_times  = {}
+    for key in d.files:
+        if key.startswith('trace_'):
+            feature_traces[key[6:]] = d[key]
+        elif key.startswith('time_'):
+            feature_times[key[5:]] = d[key]
+    sync_edge_times = d['sync_edge_times'] if 'sync_edge_times' in d.files else None
+    sr_ap = float(d['sr_ap'][0]) if 'sr_ap' in d.files else None
+    sr_lf = float(d['sr_lf'][0]) if 'sr_lf' in d.files else None
+    return feature_traces, feature_times, sync_edge_times, sr_ap, sr_lf
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Behaviour log loader  (same as video pipeline)
@@ -823,6 +977,7 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
                         ap_channels=None, lf_channels=None,
                         chunk_sec=60.0,
                         min_candidates=2,
+                        use_cache=True,
                         verbose=True):
     """
     Full ephys-to-behavior alignment for a single session.
@@ -887,9 +1042,31 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
         if verbose:
             print(f"[GT] Loaded ground truth from {Path(gt_sync_json).name}")
 
-    # ── Load ephys data ────────────────────────────────────────────────────
+    # ── Load ephys data (or restore from cache) ───────────────────────────
     feature_traces = {}
     feature_times  = {}
+
+    # Determine cache path
+    session_stem_for_cache = Path(ap_bin or lf_bin or bhv_file).stem
+    cache_path = (Path(out_folder) /
+                  f"{session_stem_for_cache}_features_cache.npz")
+
+    sync_edge_times_cached = None
+    cache_loaded = False
+
+    if use_cache and cache_path.exists():
+        if verbose:
+            print(f"[CACHE] Loading feature cache: {cache_path.name}")
+        try:
+            (feature_traces, feature_times,
+             sync_edge_times_cached, _, _) = load_feature_cache(cache_path)
+            cache_loaded = True
+            if verbose:
+                print(f"[CACHE] Loaded features: {list(feature_traces.keys())}")
+        except Exception as e:
+            warnings.warn(f"Cache load failed ({e}), re-extracting from binary.")
+            feature_traces, feature_times = {}, {}
+            cache_loaded = False
 
     # --- AP band — chunked loading (handles files >> 10 GB) ---
     if ap_bin is not None and Path(ap_bin).exists():
@@ -899,8 +1076,9 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
             meta_ap = read_spikeglx_meta(ap_bin)
             n_ch_ap, sr_ap, n_samp_ap, uv_ap = parse_spikeglx_meta(meta_ap)
 
+            # Use all neural channels; exclude last (sync) channel
             if ap_channels is None:
-                ap_channels = list(range(min(64, n_ch_ap - 1)))
+                ap_channels = list(range(n_ch_ap - 1))
 
             size_gb = len(ap_channels) * n_samp_ap * 2 / 1e9
             if verbose:
@@ -1003,7 +1181,7 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
             n_ch_lf, sr_lf, n_samp_lf, uv_lf = parse_spikeglx_meta(meta_lf)
 
             if lf_channels is None:
-                lf_channels = list(range(min(64, n_ch_lf - 1)))
+                lf_channels = list(range(n_ch_lf - 1))
             if verbose:
                 print(f"[LF] {n_ch_lf} ch, {sr_lf:.0f} Hz, "
                       f"{n_samp_lf/sr_lf:.0f} s — using {len(lf_channels)} ch")
@@ -1039,13 +1217,64 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
         raise RuntimeError("No ephys features could be extracted. "
                            "Check --ap / --lf paths and meta files.")
 
+    # ── Save feature cache if we just extracted (not loaded from cache) ───
+    if not cache_loaded and use_cache:
+        try:
+            save_feature_cache(cache_path, feature_traces, feature_times,
+                                sync_edge_times=sync_edge_times_cached)
+            if verbose:
+                print(f"[CACHE] Saved feature cache → {cache_path.name}")
+        except Exception as e:
+            warnings.warn(f"Cache save failed: {e}")
+
+    # ── Extract sync channel GT (if AP bin available and not cached) ───────
+    sync_warp = None
+    if ap_bin is not None and Path(ap_bin).exists():
+        try:
+            if sync_edge_times_cached is not None and len(sync_edge_times_cached) > 0:
+                # Already have edges from cache — re-fit warp from behavior
+                if verbose:
+                    print("[SYNC] Re-fitting warp from cached sync edges …")
+                bhv_event_times = bhv['timestamp'].values.astype(float)
+                n_match = min(len(sync_edge_times_cached), len(bhv_event_times))
+                sync_warp = fit_sync_warp(
+                    bhv_event_times[:n_match],
+                    sync_edge_times_cached[:n_match],
+                    bounds=(0.9, 1.1), offset_bounds=(-300.0, 300.0))
+                reward_mask = (bhv.iloc[:, 1].values == 3) if bhv.shape[1] >= 2 else np.ones(len(bhv), dtype=bool)
+                gt_ephys_times = (sync_warp['stretch'] *
+                                  bhv['timestamp'].values[reward_mask] +
+                                  sync_warp['offset'])
+            else:
+                gt_ephys_times_sync, sync_edges, sync_warp = extract_sync_channel(
+                    ap_bin, bhv, verbose=verbose)
+                # Cache the edges for future reruns
+                if not cache_loaded and use_cache and len(sync_edges) > 0:
+                    save_feature_cache(cache_path, feature_traces, feature_times,
+                                        sync_edge_times=sync_edges)
+                # Use as GT if sync looks valid (rmse < 50 ms)
+                if (sync_warp['n'] > 5 and
+                        not np.isnan(sync_warp['rmse']) and
+                        sync_warp['rmse'] < 0.05):
+                    gt_ephys_times = gt_ephys_times_sync
+                    if verbose:
+                        print(f"[SYNC] Using sync-channel GT "
+                              f"({len(gt_ephys_times)} reward times)")
+                else:
+                    if verbose:
+                        print("[SYNC] Sync channel present but poor fit "
+                              f"(rmse={sync_warp.get('rmse', 'n/a')}) — "
+                              "no GT available for this session.")
+        except Exception as e:
+            warnings.warn(f"Sync channel extraction failed: {e}")
+
     # ── Detect per-trial events ────────────────────────────────────────────
     if verbose:
         print(f"[DET] Detecting events across {len(trial_rwd_times)} trials …")
 
     events, all_candidates = detect_ephys_events(
         feature_traces, feature_times, trial_rwd_times,
-        search_window=(-0.1, 0.5),   # 100 ms before → 500 ms after reward
+        search_window=(-0.1, 0.5),
         min_confidence=min_conf,
         min_candidates=min_candidates)
 
@@ -1215,7 +1444,17 @@ if __name__ == '__main__':
     parser.add_argument('--ap-channels', type=str, default=None,
                         help='Comma-separated AP channel indices (e.g. 0,1,2,…,63)')
     parser.add_argument('--lf-channels', type=str, default=None,
-                        help='Comma-separated LF channel indices')
+                        help='Comma-separated LF channel indices (default: all)')
+    # Hyperparameters for feature extraction and event detection
+
+    parser.add_argument('--chunk-sec', type=float, default=60.0,
+                        help='Seconds per AP loading chunk (default 60). '
+                             'Lower to 30 if RAM runs out.')
+    parser.add_argument('--min-candidates', type=int, default=2,
+                        help='Min candidates per trial to trust confidence '
+                             '(default 2). Single-candidate trials are rejected.')
+    parser.add_argument('--no-cache', action='store_true',
+                        help='Ignore and overwrite any existing feature cache.')
 
     # Memory / quality control
     parser.add_argument('--chunk-sec', type=float, default=60.0,
@@ -1260,6 +1499,7 @@ if __name__ == '__main__':
         lf_channels    = lf_ch,
         chunk_sec      = args.chunk_sec,
         min_candidates = args.min_candidates,
+        use_cache      = not args.no_cache,
     )
 
     if args.sweep:
