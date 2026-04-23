@@ -299,102 +299,115 @@ def load_ephys_full(bin_path, channel_ids=None, dtype=np.int16,
 def extract_sync_channel(ap_bin, bhv_df, sr_ap=None, sync_ch_idx=None,
                          verbose=True):
     """
-    Read the last channel from the AP bin, detect all TTL edges, match them
-    to behavior event times, and return GT ephys times for reward events.
-
-    The sync channel toggles 0↔1 on every behavior event logged in bhv_df.
-    We fit a linear warp (behavior_time → ephys_time) using ALL matched edges,
-    then return where each reward event (code==3) falls in ephys time.
-
-    Parameters
-    ----------
-    ap_bin     : path to AP .bin or .ap file
-    bhv_df     : DataFrame from load_behavior() — columns [timestamp, code]
-    sr_ap      : sample rate (read from meta if None)
-    sync_ch_idx: channel index of sync signal (None = last channel)
-
-    Returns
-    -------
-    gt_reward_ephys_times : array length n_rewards, ephys times of rewards
-    sync_edge_times_ephys : all edge times in ephys seconds (for diagnostics)
-    warp_sync             : warp dict from the sync-channel fit
+    Read sync channel, detect TTL edges, match to reward events via ISI
+    pattern (robust to different time bases and spurious double-pulses).
     """
     meta = read_spikeglx_meta(ap_bin)
     n_ch, sr, n_samp, _ = parse_spikeglx_meta(meta)
     if sr_ap is None:
         sr_ap = sr
     if sync_ch_idx is None:
-        sync_ch_idx = n_ch - 1   # last channel = sync
+        sync_ch_idx = n_ch - 1
 
     if verbose:
         print(f"[SYNC] Reading sync channel {sync_ch_idx} "
               f"({n_samp/sr_ap/60:.1f} min @ {sr_ap:.0f} Hz) …")
 
-    # Load only the sync channel — 1 channel × n_samp × 2 bytes (manageable)
     sync_raw = load_ephys_chunk(ap_bin, 0, n_samp,
-                                 channel_ids=[sync_ch_idx])[0]  # 1-D
-
-    # Detect edges: any sample where value changes
+                                 channel_ids=[sync_ch_idx])[0]
     diff = np.diff(sync_raw.astype(np.int32))
-    edge_samples = np.where(diff != 0)[0] + 1   # +1: edge is at the new value
-    edge_times_ephys = edge_samples / sr_ap      # seconds in ephys clock
+    edge_samples = np.where(diff != 0)[0] + 1
+    edge_times   = edge_samples / sr_ap
 
     if verbose:
-        print(f"[SYNC] {len(edge_samples)} edges detected in sync channel")
+        print(f"[SYNC] {len(edge_times)} raw edges detected")
 
-    # Get all behavior event times (same order as edges)
+    if len(edge_times) == 0:
+        if bhv_df.shape[1] >= 2:
+            n_rew = int(np.sum(bhv_df.iloc[:, 1].values == 3))
+        else:
+            n_rew = len(bhv_df)
+        return np.full(n_rew, np.nan), np.array([]), \
+               {'stretch': 1.0, 'offset': 0.0, 'rmse': np.nan, 'n': 0}
+
+    # ── Keep only one edge per reward by removing edges closer than 2s ──
+    # (valve-close pulses come within ~1s of valve-open)
+    edge_isis  = np.diff(edge_times)
+    keep       = np.concatenate([[True], edge_isis > 2.0])
+    clean_edges = edge_times[keep]
+    if verbose:
+        print(f"[SYNC] {len(clean_edges)} edges after removing pairs "
+              f"(ISI > 2 s)")
+
+    # ── Get reward events from behavior log ────────────────────────────
     if bhv_df.shape[1] >= 2:
-        bhv_event_times = bhv_df['timestamp'].values.astype(float)
-        bhv_codes       = bhv_df.iloc[:, 1].values
+        codes = bhv_df.iloc[:, 1].values
+        reward_bhv_times = bhv_df['timestamp'].values[codes == 3].astype(float)
     else:
-        bhv_event_times = bhv_df['timestamp'].values.astype(float)
-        bhv_codes       = np.ones(len(bhv_event_times))
+        reward_bhv_times = bhv_df['timestamp'].values.astype(float)
 
-    n_edges = len(edge_times_ephys)
-    n_events = len(bhv_event_times)
+    n_rew   = len(reward_bhv_times)
+    n_edges = len(clean_edges)
 
-    if n_edges == 0:
-        if verbose:
-            print("[SYNC] No edges found — sync channel is flat. "
-                  "Falling back to feature-based GT.")
-        n_rewards = int(np.sum(bhv_codes == 3))
-        return (np.full(n_rewards, np.nan),
-                np.array([]),
-                {'stretch': 1.0, 'offset': 0.0, 'rmse': np.nan, 'n': 0})
-
-    # Match edges to behavior events.
-    # Both sequences are ordered in time; trim whichever is longer.
-    n_match = min(n_edges, n_events)
-    if verbose and abs(n_edges - n_events) > 5:
-        print(f"[SYNC] Warning: {n_events} behavior events vs "
-              f"{n_edges} sync edges — using first {n_match} of each.")
-
-    bhv_t_match   = bhv_event_times[:n_match]
-    ephys_t_match = edge_times_ephys[:n_match]
-
-    # Fit warp using ALL matched events (much more data than reward-only)
-    warp_sync = fit_sync_warp(bhv_t_match, ephys_t_match,
-                               bounds=(0.9, 1.1),
-                               offset_bounds=(-300.0, 300.0))
     if verbose:
-        print(f"[SYNC] Warp from sync channel: "
-              f"stretch={warp_sync['stretch']:.6f}  "
+        print(f"[SYNC] Matching {n_edges} sync edges → {n_rew} reward events")
+
+    # ── ISI-based alignment ────────────────────────────────────────────
+    # Both sequences have the same ISI pattern but different time bases.
+    # Find the constant offset: offset = bhv_time - ephys_time
+    # Use median of (bhv[i] - edge[i]) over the matched subsequence.
+    n_match = min(n_rew, n_edges)
+
+    # Trim longer sequence to same length
+    bhv_t   = reward_bhv_times[:n_match]
+    edge_t  = clean_edges[:n_match]
+
+    # Estimate time base offset robustly
+    offsets_raw = bhv_t - edge_t
+    median_off  = float(np.median(offsets_raw))
+
+    # Re-align all edges to behavior time base to find best matches
+    edge_in_bhv = clean_edges + median_off
+
+    # Greedy 1-to-1 matching: for each reward find nearest aligned edge
+    matched_bhv   = []
+    matched_ephys = []
+    used = set()
+    for ri, bt in enumerate(reward_bhv_times):
+        dists = np.abs(edge_in_bhv - bt)
+        best  = int(np.argmin(dists))
+        if best not in used and dists[best] < 2.0:   # within 2 s = same event
+            matched_bhv.append(bt)
+            matched_ephys.append(clean_edges[best])
+            used.add(best)
+
+    matched_bhv   = np.array(matched_bhv,   dtype=float)
+    matched_ephys = np.array(matched_ephys, dtype=float)
+
+    if verbose:
+        print(f"[SYNC] {len(matched_bhv)} reward events matched to sync edges")
+
+    if len(matched_bhv) < 3:
+        if verbose:
+            print("[SYNC] Too few matches — sync channel unusable as GT.")
+        return np.full(n_rew, np.nan), edge_times, \
+               {'stretch': 1.0, 'offset': 0.0, 'rmse': np.nan, 'n': 0}
+
+    # ── Fit warp on matched pairs ──────────────────────────────────────
+    warp_sync = fit_sync_warp(matched_bhv, matched_ephys,
+                               bounds=(0.9, 1.1),
+                               offset_bounds=(-2000.0, 2000.0))
+    if verbose:
+        print(f"[SYNC] Warp: stretch={warp_sync['stretch']:.6f}  "
               f"offset={warp_sync['offset']:.3f}s  "
-              f"rmse={warp_sync['rmse']:.5f}s  "
+              f"rmse={warp_sync['rmse']*1000:.2f}ms  "
               f"n={warp_sync['n']}")
 
-    # Compute GT ephys times for reward events specifically
-    reward_mask       = (bhv_codes == 3)
-    reward_bhv_times  = bhv_event_times[reward_mask]
-    gt_reward_ephys   = (warp_sync['stretch'] * reward_bhv_times
-                         + warp_sync['offset'])
+    # ── Compute GT ephys times for ALL reward events ───────────────────
+    gt_reward_ephys = (warp_sync['stretch'] * reward_bhv_times
+                       + warp_sync['offset'])
 
-    return gt_reward_ephys, edge_times_ephys, warp_sync
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Feature cache  — save/load extracted traces so 105 GB is only read once
-# ──────────────────────────────────────────────────────────────────────────────
+    return gt_reward_ephys, edge_times, warp_sync
 
 def save_feature_cache(cache_path, feature_traces, feature_times,
                        sync_edge_times=None, sr_ap=None, sr_lf=None):
@@ -453,60 +466,78 @@ def load_behavior(bhv_file):
 # Best detected on raw AP trace (30 kHz); appears on ALL channels simultaneously.
 # ──────────────────────────────────────────────────────────────────────────────
 
-def extract_solenoid_artifact(ap_data, sr_ap, uv_per_bit=1.0,
-                              threshold_sd=8.0, min_distance_samples=None,
-                              n_channels_for_consensus=20):
+def extract_solenoid_artifact(ap_data, sr_ap, mode='global',
+                              threshold_sd=8.0,
+                              n_channels_for_consensus=20,
+                              block_size=32,
+                              block_stride=16,
+                              min_distance_samples=None):
     """
-    Detect reward-valve electromagnetic artifacts in the AP band.
+    Build a solenoid-like common-mode trace using one of three variants:
 
-    Strategy
-    --------
-    1. Compute the cross-channel median trace (common-mode signal).
-       Solenoid fires affect ALL channels simultaneously → they survive
-       median-across-channels; single-unit spikes are local and cancel out.
-    2. Z-score and threshold.
-    3. Keep peaks separated by at least min_distance (default 100 ms).
-
-    Parameters
-    ----------
-    ap_data   : (n_ch, n_samples) float array, in counts or µV
-    sr_ap     : AP sample rate (Hz), typically 30000
-    threshold_sd : how many SDs above mean to call an artifact
-    n_channels_for_consensus : how many channels to median over
+      mode='global'      -> median across all selected channels
+      mode='block'       -> median across overlapping depth windows
+      mode='derivative'  -> abs(diff(global common-mode))
 
     Returns
     -------
-    event_samples : 1-D array of sample indices for each detected artifact
-    common_mode   : 1-D float array of the median trace (for diagnostics)
+    event_samples : indices of detected candidate peaks
+    z_trace       : z-scored trace used for peak detection
+    raw_trace     : raw common-mode trace before z-scoring
     """
     if min_distance_samples is None:
-        min_distance_samples = int(0.1 * sr_ap)  # 100 ms
+        min_distance_samples = int(0.1 * sr_ap)
 
-    # Use a random subset if many channels (faster)
+    ap_data = np.asarray(ap_data, dtype=float)
     n_ch = ap_data.shape[0]
-    if n_ch > n_channels_for_consensus:
-        rng = np.random.RandomState(42)
-        ch_idx = rng.choice(n_ch, n_channels_for_consensus, replace=False)
+
+    if mode == 'global':
+        if n_ch > n_channels_for_consensus:
+            rng = np.random.RandomState(42)
+            ch_idx = rng.choice(n_ch, n_channels_for_consensus, replace=False)
+        else:
+            ch_idx = np.arange(n_ch)
+        raw_trace = np.median(ap_data[ch_idx, :], axis=0).astype(float)
+
+    elif mode == 'block':
+        traces = []
+        block_size = max(2, int(block_size))
+        block_stride = max(1, int(block_stride))
+
+        for start in range(0, max(1, n_ch - block_size + 1), block_stride):
+            blk = ap_data[start:start + block_size, :]
+            if blk.shape[0] >= 8:
+                traces.append(np.median(blk, axis=0).astype(float))
+
+        if len(traces) == 0:
+            raw_trace = np.median(ap_data, axis=0).astype(float)
+        else:
+            raw_trace = np.median(np.vstack(traces), axis=0).astype(float)
+
+    elif mode == 'derivative':
+        if n_ch > n_channels_for_consensus:
+            rng = np.random.RandomState(42)
+            ch_idx = rng.choice(n_ch, n_channels_for_consensus, replace=False)
+        else:
+            ch_idx = np.arange(n_ch)
+        base = np.median(ap_data[ch_idx, :], axis=0).astype(float)
+        raw_trace = np.abs(np.diff(base, prepend=base[0]))
+
     else:
-        ch_idx = np.arange(n_ch)
+        raise ValueError(f"Unknown solenoid mode: {mode}")
 
-    # Common-mode trace: captures electrical artefacts shared across all channels
-    common_mode = np.median(ap_data[ch_idx, :], axis=0).astype(float)
+    abs_raw = np.abs(raw_trace)
+    mu = np.nanmean(abs_raw)
+    sd = np.nanstd(abs_raw)
+    z_trace = (abs_raw - mu) / (sd if sd > 0 else 1.0)
 
-    # Absolute value so we detect both polarities
-    abs_cm = np.abs(common_mode)
+    event_samples, _ = find_peaks(
+        z_trace,
+        height=threshold_sd,
+        distance=min_distance_samples
+    )
 
-    # Z-score
-    mu, sd = np.nanmean(abs_cm), np.nanstd(abs_cm)
-    if sd == 0:
-        return np.array([], dtype=int), common_mode
-    z = (abs_cm - mu) / sd
-
-    # Peak detection
-    event_samples, _ = find_peaks(z, height=threshold_sd,
-                                  distance=min_distance_samples)
-    return event_samples, common_mode
-
+    return event_samples, z_trace, raw_trace
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FEATURE 2 — LFP deflection
@@ -812,6 +843,91 @@ def detect_ephys_events(feature_traces, feature_times,
 
     return events, all_candidates
 
+def audit_feature_quality(feature_name, trace, times, reward_times,
+                          search_window=(-0.1, 0.5),
+                          peak_prominence=None,
+                          peak_distance_s=0.15):
+    """
+    Simple per-feature audit:
+    - how often it produces a peak near reward
+    - median timing error to nearest reward
+    - false peak rate outside reward windows
+
+    Assumes trace is already roughly normalized / z-scored.
+    """
+    trace = np.asarray(trace, dtype=float)
+    times = np.asarray(times, dtype=float)
+    reward_times = np.asarray(reward_times, dtype=float)
+
+    good = np.isfinite(trace) & np.isfinite(times)
+    trace = trace[good]
+    times = times[good]
+
+    if trace.size < 3 or reward_times.size == 0:
+        return {
+            'feature': feature_name,
+            'n_peaks': 0,
+            'n_reward_trials': int(reward_times.size),
+            'trial_hit_rate': np.nan,
+            'median_abs_error_s': np.nan,
+            'mean_abs_error_s': np.nan,
+            'false_peak_rate': np.nan,
+            'peak_times': [],
+            'peak_errors_s': []
+        }
+
+    dt = np.median(np.diff(times)) if len(times) > 1 else 1.0
+    min_dist_samples = max(1, int(peak_distance_s / dt))
+
+    if peak_prominence is None:
+        # conservative default for z-scored traces
+        peak_prominence = 1.0
+
+    peaks, props = find_peaks(trace, prominence=peak_prominence,
+                              distance=min_dist_samples)
+
+    peak_times = times[peaks] if len(peaks) else np.array([], dtype=float)
+
+    # Reward hit rate: at least one peak in the search window around each reward
+    hits = 0
+    peak_errors = []
+
+    for rt in reward_times:
+        w0 = rt + search_window[0]
+        w1 = rt + search_window[1]
+        in_win = (peak_times >= w0) & (peak_times <= w1)
+
+        if np.any(in_win):
+            hits += 1
+            # error to nearest peak in window
+            nearest = peak_times[in_win][np.argmin(np.abs(peak_times[in_win] - rt))]
+            peak_errors.append(float(nearest - rt))
+
+    trial_hit_rate = hits / len(reward_times) if len(reward_times) else np.nan
+
+    # false peaks = peaks not near any reward window
+    false_peaks = 0
+    for pt in peak_times:
+        near_any = np.any((pt >= reward_times + search_window[0]) &
+                          (pt <= reward_times + search_window[1]))
+        if not near_any:
+            false_peaks += 1
+
+    false_peak_rate = false_peaks / len(peak_times) if len(peak_times) else np.nan
+
+    abs_err = np.abs(np.asarray(peak_errors, dtype=float)) if peak_errors else np.array([])
+
+    return {
+        'feature': feature_name,
+        'n_peaks': int(len(peak_times)),
+        'n_reward_trials': int(len(reward_times)),
+        'trial_hit_rate': float(trial_hit_rate) if np.isfinite(trial_hit_rate) else np.nan,
+        'median_abs_error_s': float(np.median(abs_err)) if abs_err.size else np.nan,
+        'mean_abs_error_s': float(np.mean(abs_err)) if abs_err.size else np.nan,
+        'false_peak_rate': float(false_peak_rate) if np.isfinite(false_peak_rate) else np.nan,
+        'peak_times': peak_times.tolist(),
+        'peak_errors_s': [float(x) for x in peak_errors],
+    }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Hyperparameter sweep  (mirrors video pipeline)
@@ -965,6 +1081,8 @@ def save_diagnostics(out_folder, name_prefix, **arrays):
     return npz_path
 
 
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main session processor
 # ──────────────────────────────────────────────────────────────────────────────
@@ -977,32 +1095,10 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
                         ap_channels=None, lf_channels=None,
                         chunk_sec=60.0,
                         min_candidates=2,
+                        solenoid_mode='global',
                         use_cache=True,
+                        analysis_only=False,
                         verbose=True):
-    """
-    Full ephys-to-behavior alignment for a single session.
-
-    Parameters
-    ----------
-    bhv_file     : path to GlobalLog*.csv
-    ap_bin       : path to *.ap.bin  (SpikeGLX AP band)
-    lf_bin       : path to *.lf.bin  (SpikeGLX LF band)
-    ks_folder    : path to Kilosort output folder (optional)
-    out_folder   : where to save outputs
-    gt_sync_json : video-pipeline sync JSON for ground-truth comparison
-    feature_list : list of feature names to extract; None = all available
-    make_sync    : whether to write the canonical sync JSON
-    train_frac   : fraction of GT trials used for warp training
-    min_conf     : minimum confidence for event acceptance
-    ap_channels  : channel indices to use for AP features (None = auto subset)
-    lf_channels  : channel indices to use for LF features (None = auto subset)
-    chunk_sec    : seconds per chunk when memory-efficient loading needed
-    verbose      : print progress
-
-    Returns
-    -------
-    session_dict with all signals and results.
-    """
     bhv_file   = Path(bhv_file)
     out_folder = Path(out_folder) if out_folder else bhv_file.parent
     out_folder.mkdir(parents=True, exist_ok=True)
@@ -1026,10 +1122,11 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
             trial_rwd_times = bhv['timestamp'][code_col == 300].values
     else:
         trial_rwd_times = bhv['timestamp'].values
+
     if verbose:
         print(f"[BHV] {len(trial_rwd_times)} reward events found")
 
-    # ── Load ground truth from video sync (if provided) ───────────────────
+    # ── Ground truth (video) ──────────────────────────────────────────────
     gt_ephys_times = np.full(len(trial_rwd_times), np.nan)
     if gt_sync_json is not None and Path(gt_sync_json).exists():
         with open(gt_sync_json) as f:
@@ -1037,23 +1134,21 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
         warp_gt = gt_data.get('warp', {})
         s_gt = warp_gt.get('stretch', 1.0)
         o_gt = warp_gt.get('offset',  0.0)
-        # Convert behavior times → video times (used as GT for ephys)
         gt_ephys_times = s_gt * trial_rwd_times + o_gt
         if verbose:
             print(f"[GT] Loaded ground truth from {Path(gt_sync_json).name}")
 
-    # ── Load ephys data (or restore from cache) ───────────────────────────
+    # ── Feature containers ────────────────────────────────────────────────
     feature_traces = {}
     feature_times  = {}
 
-    # Determine cache path
     session_stem_for_cache = Path(ap_bin or lf_bin or bhv_file).stem
-    cache_path = (Path(out_folder) /
-                  f"{session_stem_for_cache}_features_cache.npz")
+    cache_path = Path(out_folder) / f"{session_stem_for_cache}_{solenoid_mode}_features_cache.npz"
 
     sync_edge_times_cached = None
     cache_loaded = False
 
+    # ── Cache load ────────────────────────────────────────────────────────
     if use_cache and cache_path.exists():
         if verbose:
             print(f"[CACHE] Loading feature cache: {cache_path.name}")
@@ -1064,37 +1159,50 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
             if verbose:
                 print(f"[CACHE] Loaded features: {list(feature_traces.keys())}")
         except Exception as e:
-            warnings.warn(f"Cache load failed ({e}), re-extracting from binary.")
+            warnings.warn(f"Cache load failed ({e}), re-extracting.")
             feature_traces, feature_times = {}, {}
             cache_loaded = False
 
-    # --- AP band — chunked loading (handles files >> 10 GB) ---
-    if ap_bin is not None and Path(ap_bin).exists():
+    # ── Decide what needs extraction ──────────────────────────────────────
+    requested_features = set(feature_list or [])
+    if not requested_features:
+        requested_features = {
+            'solenoid_artifact', 'mua_envelope',
+            'lfp_deflection', 'lick_band'
+        }
+
+    need_ap = (
+        ap_bin is not None and Path(ap_bin).exists() and
+        any(f in requested_features and f not in feature_traces
+            for f in ('solenoid_artifact', 'mua_envelope'))
+    )
+
+    need_lf = (
+        lf_bin is not None and Path(lf_bin).exists() and
+        any(f in requested_features and f not in feature_traces
+            for f in ('lfp_deflection', 'lick_band'))
+    )
+
+    # ── AP extraction ─────────────────────────────────────────────────────
+    if need_ap:
         if verbose:
             print(f"[AP] Reading {Path(ap_bin).name} …")
+
         try:
             meta_ap = read_spikeglx_meta(ap_bin)
             n_ch_ap, sr_ap, n_samp_ap, uv_ap = parse_spikeglx_meta(meta_ap)
 
-            # Use all neural channels; exclude last (sync) channel
             if ap_channels is None:
                 ap_channels = list(range(n_ch_ap - 1))
 
-            size_gb = len(ap_channels) * n_samp_ap * 2 / 1e9
-            if verbose:
-                print(f"[AP] {n_ch_ap} ch total, {sr_ap:.0f} Hz, "
-                      f"{n_samp_ap/sr_ap/60:.1f} min — using {len(ap_channels)} ch "
-                      f"({size_gb:.1f} GB) — chunked @ {chunk_sec}s")
+            chunk_samp   = int(chunk_sec * sr_ap)
+            overlap_samp = int(0.5 * sr_ap)
+            ds_factor    = max(1, int(sr_ap / 1000.0))
+
+            cm_chunks, mua_chunks = [], []
 
             do_solenoid = 'solenoid_artifact' in feature_list
             do_mua      = 'mua_envelope'      in feature_list
-
-            chunk_samp   = int(chunk_sec * sr_ap)   # samples per core chunk
-            overlap_samp = int(0.5 * sr_ap)         # 0.5 s overlap for filter settling
-            ds_factor    = max(1, int(sr_ap / 1000.0))  # AP → 1 kHz for MUA
-
-            cm_chunks  = []   # solenoid common-mode (full SR)
-            mua_chunks = []   # MUA raw envelope (downsampled, z-score later)
 
             n_chunks = int(np.ceil(n_samp_ap / chunk_samp))
 
@@ -1105,41 +1213,49 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
                 load_start = max(0, core_start - overlap_samp)
                 load_end   = min(n_samp_ap, core_end + overlap_samp)
 
-                pre_pad  = core_start - load_start   # overlap samples before core
-                post_pad = load_end   - core_end      # overlap samples after core
-
-                if verbose:
-                    pct = 100.0 * core_end / n_samp_ap
-                    print(f"[AP] chunk {ci+1}/{n_chunks}  "
-                          f"{core_start/sr_ap/60:.1f}–{core_end/sr_ap/60:.1f} min  "
-                          f"({pct:.0f}%)", end='\r', flush=True)
+                pre_pad  = core_start - load_start
+                post_pad = load_end   - core_end
 
                 chunk = load_ephys_chunk(ap_bin, load_start, load_end,
                                          channel_ids=ap_channels)
                 chunk = (chunk * uv_ap).astype(np.float32)
 
                 if do_solenoid:
-                    # Median across channels at each sample — no temporal filter,
-                    # so overlap is only needed for bookkeeping (trim it back).
-                    cm = np.median(chunk, axis=0).astype(np.float64)
-                    end_idx = len(cm) - post_pad if post_pad > 0 else None
-                    cm_chunks.append(cm[pre_pad:end_idx])
+                    if solenoid_mode == 'global':
+                        sol_raw = np.median(chunk, axis=0).astype(np.float64)
+
+                    elif solenoid_mode == 'block':
+                        block_size = 32
+                        block_stride = 16
+                        block_traces = []
+                        for start in range(0, max(1, chunk.shape[0] - block_size + 1), block_stride):
+                            blk = chunk[start:start + block_size, :]
+                            if blk.shape[0] >= 8:
+                                block_traces.append(np.median(blk, axis=0).astype(np.float64))
+                        if len(block_traces) == 0:
+                            sol_raw = np.median(chunk, axis=0).astype(np.float64)
+                        else:
+                            sol_raw = np.median(np.vstack(block_traces), axis=0).astype(np.float64)
+
+                    elif solenoid_mode == 'derivative':
+                        base = np.median(chunk, axis=0).astype(np.float64)
+                        sol_raw = np.abs(np.diff(base, prepend=base[0]))
+
+                    else:
+                        raise ValueError(f"Unknown solenoid_mode: {solenoid_mode}")
+
+                    end_idx = len(sol_raw) - post_pad if post_pad > 0 else None
+                    cm_chunks.append(sol_raw[pre_pad:end_idx])
 
                 if do_mua:
-                    # extract_mua_envelope applies bandpass + medfilt internally.
-                    # We use the raw (non-z-scored) output and z-score after assembly.
-                    _, _, mua_raw_c = extract_mua_envelope(chunk, sr_ap)
+                    _, _, mua_raw = extract_mua_envelope(chunk, sr_ap)
                     pre_ds  = pre_pad  // ds_factor
-                    post_ds = post_pad // ds_factor if post_pad > 0 else 0
-                    end_idx_ds = len(mua_raw_c) - post_ds if post_ds > 0 else None
-                    mua_chunks.append(mua_raw_c[pre_ds:end_idx_ds])
+                    post_ds = post_pad // ds_factor
+                    end_idx = len(mua_raw) - post_ds if post_ds > 0 else None
+                    mua_chunks.append(mua_raw[pre_ds:end_idx])
 
-                del chunk  # free memory immediately
+                del chunk
 
-            if verbose:
-                print()  # newline after \r progress line
-
-            # --- Assemble solenoid feature from chunks ---
             if do_solenoid:
                 cm_full = np.concatenate(cm_chunks)
                 abs_cm  = np.abs(cm_full)
@@ -1147,257 +1263,134 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
                 cm_z    = (abs_cm - mu) / (sd if sd > 0 else 1.0)
                 t_art   = np.arange(len(cm_z)) / sr_ap
                 min_dist_samp = int(0.1 * sr_ap)
-                ev_samp, _ = find_peaks(cm_z, height=8.0,
-                                         distance=min_dist_samp)
+                ev_samp, _ = find_peaks(cm_z, height=8.0, distance=min_dist_samp)
+                
                 feature_traces['solenoid_artifact'] = cm_z
                 feature_times['solenoid_artifact']  = t_art
                 if verbose:
-                    print(f"[FEAT] solenoid: {len(ev_samp)} candidate events")
+                    print(f"[FEAT] solenoid({solenoid_mode}): {len(ev_samp)} candidate events")
                 del cm_full, cm_chunks
 
-            # --- Assemble MUA feature from chunks ---
             if do_mua:
                 mua_full = np.concatenate(mua_chunks)
-                mu, sd   = np.nanmean(mua_full), np.nanstd(mua_full)
-                mua_z    = (mua_full - mu) / (sd if sd > 0 else 1.0)
-                sr_ds    = sr_ap / ds_factor
-                mua_t    = np.arange(len(mua_z)) / sr_ds
+                mua_z = (mua_full - np.mean(mua_full)) / np.std(mua_full)
+                sr_ds = sr_ap / ds_factor
+                mua_t = np.arange(len(mua_z)) / sr_ds
                 feature_traces['mua_envelope'] = mua_z
                 feature_times['mua_envelope']  = mua_t
-                if verbose:
-                    print(f"[FEAT] MUA: {len(mua_t)} samples @ {sr_ds:.0f} Hz")
-                del mua_full, mua_chunks
 
         except Exception as e:
             warnings.warn(f"AP extraction failed: {e}")
-            import traceback; traceback.print_exc()
 
-    # --- LF band ---
-    if lf_bin is not None and Path(lf_bin).exists():
+    # ── LF extraction ─────────────────────────────────────────────────────
+    if need_lf:
         if verbose:
             print(f"[LF] Reading {Path(lf_bin).name} …")
+
         try:
             meta_lf = read_spikeglx_meta(lf_bin)
             n_ch_lf, sr_lf, n_samp_lf, uv_lf = parse_spikeglx_meta(meta_lf)
 
             if lf_channels is None:
                 lf_channels = list(range(n_ch_lf - 1))
-            if verbose:
-                print(f"[LF] {n_ch_lf} ch, {sr_lf:.0f} Hz, "
-                      f"{n_samp_lf/sr_lf:.0f} s — using {len(lf_channels)} ch")
 
             lf_data = load_ephys_chunk(lf_bin, 0, n_samp_lf,
-                                        channel_ids=lf_channels)
+                                      channel_ids=lf_channels)
             lf_data = (lf_data * uv_lf).astype(np.float32)
 
             if 'lfp_deflection' in feature_list:
-                if verbose:
-                    print("[FEAT] Extracting LFP deflection …")
-                lf_t, lf_z, lf_raw, lf_exp = extract_lfp_deflection(
-                    lf_data, sr_lf)
+                lf_t, lf_z, _, _ = extract_lfp_deflection(lf_data, sr_lf)
                 feature_traces['lfp_deflection'] = lf_z
                 feature_times['lfp_deflection']  = lf_t
-                if verbose:
-                    print(f"[FEAT] LFP PC1 explained var: "
-                          f"{lf_exp[0]*100:.1f}%")
 
             if 'lick_band' in feature_list:
-                if verbose:
-                    print("[FEAT] Extracting lick-band power …")
-                lk_t, lk_z, lk_raw = extract_lick_band(lf_data, sr_lf)
+                lk_t, lk_z, _ = extract_lick_band(lf_data, sr_lf)
                 feature_traces['lick_band'] = lk_z
                 feature_times['lick_band']  = lk_t
-                if verbose:
-                    print("[FEAT] lick_band done")
 
         except Exception as e:
             warnings.warn(f"LF extraction failed: {e}")
 
     if not feature_traces:
-        raise RuntimeError("No ephys features could be extracted. "
-                           "Check --ap / --lf paths and meta files.")
+        raise RuntimeError("No features extracted.")
+        # ── Per-feature audit phase ──────────────────────────────────────────
+    feature_audit = {}
+    for fname in feature_traces:
+        feature_audit[fname] = audit_feature_quality(
+            fname,
+            feature_traces[fname],
+            feature_times[fname],
+            trial_rwd_times,
+            search_window=(-0.1, 0.5),
+            peak_prominence=1.0,
+            peak_distance_s=0.15
+        )
 
-    # ── Save feature cache if we just extracted (not loaded from cache) ───
-    if not cache_loaded and use_cache:
-        try:
-            save_feature_cache(cache_path, feature_traces, feature_times,
-                                sync_edge_times=sync_edge_times_cached)
-            if verbose:
-                print(f"[CACHE] Saved feature cache → {cache_path.name}")
-        except Exception as e:
-            warnings.warn(f"Cache save failed: {e}")
-
-    # ── Extract sync channel GT (if AP bin available and not cached) ───────
-    sync_warp = None
-    if ap_bin is not None and Path(ap_bin).exists():
-        try:
-            if sync_edge_times_cached is not None and len(sync_edge_times_cached) > 0:
-                # Already have edges from cache — re-fit warp from behavior
-                if verbose:
-                    print("[SYNC] Re-fitting warp from cached sync edges …")
-                bhv_event_times = bhv['timestamp'].values.astype(float)
-                n_match = min(len(sync_edge_times_cached), len(bhv_event_times))
-                sync_warp = fit_sync_warp(
-                    bhv_event_times[:n_match],
-                    sync_edge_times_cached[:n_match],
-                    bounds=(0.9, 1.1), offset_bounds=(-300.0, 300.0))
-                reward_mask = (bhv.iloc[:, 1].values == 3) if bhv.shape[1] >= 2 else np.ones(len(bhv), dtype=bool)
-                gt_ephys_times = (sync_warp['stretch'] *
-                                  bhv['timestamp'].values[reward_mask] +
-                                  sync_warp['offset'])
-            else:
-                gt_ephys_times_sync, sync_edges, sync_warp = extract_sync_channel(
-                    ap_bin, bhv, verbose=verbose)
-                # Cache the edges for future reruns
-                if not cache_loaded and use_cache and len(sync_edges) > 0:
-                    save_feature_cache(cache_path, feature_traces, feature_times,
-                                        sync_edge_times=sync_edges)
-                # Use as GT if sync looks valid (rmse < 50 ms)
-                if (sync_warp['n'] > 5 and
-                        not np.isnan(sync_warp['rmse']) and
-                        sync_warp['rmse'] < 0.05):
-                    gt_ephys_times = gt_ephys_times_sync
-                    if verbose:
-                        print(f"[SYNC] Using sync-channel GT "
-                              f"({len(gt_ephys_times)} reward times)")
-                else:
-                    if verbose:
-                        print("[SYNC] Sync channel present but poor fit "
-                              f"(rmse={sync_warp.get('rmse', 'n/a')}) — "
-                              "no GT available for this session.")
-        except Exception as e:
-            warnings.warn(f"Sync channel extraction failed: {e}")
-
-    # ── Detect per-trial events ────────────────────────────────────────────
     if verbose:
-        print(f"[DET] Detecting events across {len(trial_rwd_times)} trials …")
+        print("[AUDIT] Per-feature summary:")
+        for fname, stats in feature_audit.items():
+            print(
+                f"[AUDIT] {fname:20s}  "
+                f"hit_rate={stats['trial_hit_rate']:.3f}  "
+                f"med_err={stats['median_abs_error_s']:.3f}s  "
+                f"false_peak_rate={stats['false_peak_rate']:.3f}  "
+                f"n_peaks={stats['n_peaks']}"
+            )
 
-    events, all_candidates = detect_ephys_events(
+    if analysis_only:
+        session_stem = Path(ap_bin or lf_bin or bhv_file).stem
+        save_diagnostics(
+            out_folder, session_stem,
+            trial_rwd_times=trial_rwd_times,
+            **{f'trace_{k}': feature_traces[k] for k in feature_traces},
+            **{f'time_{k}': feature_times[k] for k in feature_times}
+        )
+        return {
+            'feature_traces': feature_traces,
+            'feature_times': feature_times,
+            'feature_audit': feature_audit,
+            'trial_rwd_times': trial_rwd_times,
+            'detected_times': np.array([]),
+            'gt_ephys_times': gt_ephys_times,
+            'warp': None,
+            'events': None,
+            'gt_metrics': {},
+            'session_stem': session_stem,
+        }
+    # ── Detect events ─────────────────────────────────────────────────────
+    events, _ = detect_ephys_events(
         feature_traces, feature_times, trial_rwd_times,
         search_window=(-0.1, 0.5),
         min_confidence=min_conf,
         min_candidates=min_candidates)
 
     detected_times = np.array(
-        [e['time'] if e is not None else np.nan for e in events],
-        dtype=float)
+        [e['time'] if e is not None else np.nan for e in events])
 
-    n_detected = int(np.isfinite(detected_times).sum())
-    if verbose:
-        print(f"[DET] {n_detected}/{len(trial_rwd_times)} trials detected "
-              f"(min_conf={min_conf})")
-
-    # ── Fit warp (behavior → ephys time) ──────────────────────────────────
-    # Match behavior reward times to detected ephys event times
-    bhv_times_for_warp  = trial_rwd_times.copy()
-    ephys_times_for_warp = detected_times.copy()
-
-    valid_for_fit = np.isfinite(bhv_times_for_warp) & np.isfinite(ephys_times_for_warp)
+    # ── Fit warp ──────────────────────────────────────────────────────────
+    valid = np.isfinite(detected_times)
     warp = {'stretch': 1.0, 'offset': 0.0, 'rmse': np.nan, 'n': 0}
 
-    if valid_for_fit.sum() >= 3:
-        idxs = np.where(valid_for_fit)[0].copy()
-        rng  = np.random.RandomState(0)
-        rng.shuffle(idxs)
-        n_train = max(1, int(len(idxs) * train_frac))
-        train_idx, test_idx = idxs[:n_train], idxs[n_train:]
+    if valid.sum() >= 3:
+        warp = fit_sync_warp(trial_rwd_times[valid], detected_times[valid])
 
-        warp = fit_sync_warp(bhv_times_for_warp[train_idx],
-                              ephys_times_for_warp[train_idx],
-                              bounds=(0.8, 1.25),
-                              offset_bounds=(-100.0, 100.0))
-        if verbose:
-            print(f"[WARP] stretch={warp['stretch']:.6f}  "
-                  f"offset={warp['offset']:.3f}s  "
-                  f"rmse={warp['rmse']:.4f}s  "
-                  f"n_train={len(train_idx)}")
-
-        # Evaluate on test set
-        if len(test_idx) > 0:
-            pred  = warp['stretch'] * bhv_times_for_warp[test_idx] + warp['offset']
-            true  = ephys_times_for_warp[test_idx]
-            test_metrics = evaluate_against_ground_truth(pred, true,
-                                                          tolerance_ms=50)
-            if verbose:
-                print(f"[EVAL] test set metrics: {test_metrics}")
-    else:
-        if verbose:
-            warnings.warn("Not enough matched trials (≥3) for warp fitting.")
-
-    # ── Evaluate against video GT (if available) ──────────────────────────
-    gt_metrics = {}
-    if np.isfinite(gt_ephys_times).sum() >= 3:
-        # Apply warp to predict ephys times from behavior times
-        pred_ephys = warp['stretch'] * trial_rwd_times + warp['offset']
-        gt_metrics = evaluate_against_ground_truth(
-            pred_ephys, gt_ephys_times, tolerance_ms=50)
-        if verbose:
-            print(f"[GT_EVAL] vs video GT: {gt_metrics}")
-
-    # ── Write canonical sync file ──────────────────────────────────────────
-    session_stem = Path(ap_bin or lf_bin or bhv_file).stem
+    # ── Save sync ─────────────────────────────────────────────────────────
     if make_sync:
-        events_map = []
-        for ti in range(len(trial_rwd_times)):
-            bt = (float(trial_rwd_times[ti])
-                  if np.isfinite(trial_rwd_times[ti]) else None)
-            et = (float(warp['stretch'] * bt + warp['offset'])
-                  if bt is not None else None)
-            conf = (events[ti]['confidence']
-                    if (events[ti] is not None) else None)
-            events_map.append({'trial_idx': int(ti),
-                                'behavior_time': bt,
-                                'ephys_time': et,
-                                'confidence': conf})
-        metadata = {
-            'bhv_file':     str(bhv_file),
-            'ap_bin':       str(ap_bin) if ap_bin else None,
-            'lf_bin':       str(lf_bin) if lf_bin else None,
-            'features_used': list(feature_traces.keys()),
-            'created':       datetime.now().isoformat(),
-        }
+        session_stem = Path(ap_bin or lf_bin or bhv_file).stem
         sync_out = out_folder / f"sync_ephys_{session_stem}.json"
-        write_sync_file(str(sync_out), warp, events_map, metadata)
-        if verbose:
-            print(f"[SYNC] Wrote {sync_out}")
 
-        # MATLAB-compatible output
-        try:
-            mat_out = out_folder / f"syncfix_ephys_{session_stem}.mat"
-            savemat(str(mat_out), {
-                'trial_rwd_times':    trial_rwd_times,
-                'detected_ephys_times': detected_times,
-                'warp_stretch':       float(warp['stretch']),
-                'warp_offset':        float(warp['offset']),
-                'warp_rmse':          float(warp['rmse'])
-                                      if not np.isnan(warp['rmse']) else -1.0,
-            })
-            if verbose:
-                print(f"[SYNC] Wrote MAT: {mat_out}")
-        except Exception as e:
-            warnings.warn(f"MAT save failed: {e}")
-
-    # ── Save diagnostics ───────────────────────────────────────────────────
-    save_diagnostics(out_folder, session_stem,
-                     trial_rwd_times=trial_rwd_times,
-                     detected_times=detected_times,
-                     gt_ephys_times=gt_ephys_times,
-                     warp_bi=np.array([warp['stretch'], warp['offset']]),
-                     **{f'trace_{k}': feature_traces[k]
-                        for k in feature_traces},
-                     **{f'time_{k}': feature_times[k]
-                        for k in feature_times})
+        write_sync_file(
+            str(sync_out),
+            warp,
+            [],
+            {'features_used': list(feature_traces.keys())}
+        )
 
     return {
-        'feature_traces':    feature_traces,
-        'feature_times':     feature_times,
-        'trial_rwd_times':   trial_rwd_times,
-        'detected_times':    detected_times,
-        'gt_ephys_times':    gt_ephys_times,
-        'warp':              warp,
-        'events':            events,
-        'gt_metrics':        gt_metrics,
-        'session_stem':      session_stem,
+        'feature_traces': feature_traces,
+        'feature_times': feature_times,
+        'detected_times': detected_times,
+        'warp': warp
     }
 
 
@@ -1423,7 +1416,8 @@ if __name__ == '__main__':
                         help='Video-pipeline sync JSON for ground-truth comparison')
     parser.add_argument('--out', default=None,
                         help='Output folder')
-
+    parser.add_argument('--analysis-only', action='store_true',
+                    help='Extract and audit features only; skip warp fitting.')
     # Feature selection
     parser.add_argument('--feature', default='all',
                         choices=['all', 'solenoid_artifact', 'lfp_deflection',
@@ -1460,7 +1454,9 @@ if __name__ == '__main__':
                              'confidence score. Trials with fewer candidates are '
                              'rejected (confidence 1.0 from single candidate is '
                              'uninformative). Default 2.')
-
+    parser.add_argument('--solenoid-mode', default='global',
+                    choices=['global', 'block', 'derivative'],
+                    help='Solenoid extraction variant to use.')
     args = parser.parse_args()
 
     # Parse channel lists
@@ -1480,23 +1476,25 @@ if __name__ == '__main__':
 
     # Run
     session_res = process_one_session(
-        bhv_file       = args.bhv,
-        ap_bin         = args.ap,
-        lf_bin         = args.lf,
-        ks_folder      = args.ks,
-        out_folder     = args.out,
-        gt_sync_json   = args.gt,
-        feature_list   = feat_list,
-        make_sync      = args.make_sync,
-        train_frac     = args.train_frac,
-        min_conf       = args.min_conf,
-        ap_channels    = ap_ch,
-        lf_channels    = lf_ch,
-        chunk_sec      = args.chunk_sec,
-        min_candidates = args.min_candidates,
-        use_cache      = not args.no_cache,
-    )
-
+    bhv_file       = args.bhv,
+    ap_bin         = args.ap,
+    lf_bin         = args.lf,
+    ks_folder      = args.ks,
+    out_folder     = args.out,
+    gt_sync_json   = args.gt,
+    feature_list   = feat_list,
+    make_sync      = args.make_sync,
+    train_frac     = args.train_frac,
+    min_conf       = args.min_conf,
+    ap_channels    = ap_ch,
+    lf_channels    = lf_ch,
+    chunk_sec      = args.chunk_sec,
+    min_candidates = args.min_candidates,
+    use_cache      = not args.no_cache,
+    analysis_only  = args.analysis_only,
+    solenoid_mode  = args.solenoid_mode,
+    verbose        = True,
+)
     if args.sweep:
         out_folder = args.out or str(Path(args.bhv).parent)
         csv_path = hyperparameter_sweep(
