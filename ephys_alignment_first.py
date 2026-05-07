@@ -426,6 +426,33 @@ def save_feature_cache(cache_path, feature_traces, feature_times,
     np.savez_compressed(str(cache_path), **payload)
     return cache_path
 
+def update_feature_cache(cache_path, new_traces, new_times,
+                         sync_edge_times=None, sr_ap=None, sr_lf=None):
+    """
+    Merge new features into an existing cache without re-extracting old ones.
+    If cache doesn't exist yet, creates it fresh.
+    """
+    existing_traces, existing_times = {}, {}
+    existing_sync = None
+    existing_sr_ap = None
+    existing_sr_lf = None
+
+    if Path(cache_path).exists():
+        try:
+            (existing_traces, existing_times,
+             existing_sync, existing_sr_ap,
+             existing_sr_lf) = load_feature_cache(cache_path)
+        except Exception:
+            pass
+
+    merged_traces = {**existing_traces, **new_traces}
+    merged_times  = {**existing_times,  **new_times}
+    merged_sync   = sync_edge_times if sync_edge_times is not None else existing_sync
+    merged_sr_ap  = sr_ap if sr_ap is not None else existing_sr_ap
+    merged_sr_lf  = sr_lf if sr_lf is not None else existing_sr_lf
+
+    save_feature_cache(cache_path, merged_traces, merged_times,
+                       merged_sync, merged_sr_ap, merged_sr_lf)
 
 def load_feature_cache(cache_path):
     """
@@ -547,58 +574,130 @@ def extract_solenoid_artifact(ap_data, sr_ap, mode='global',
 def extract_lfp_deflection(lf_data, sr_lf, uv_per_bit=1.0,
                             bandpass=(1.0, 100.0),
                             n_channels_pca=20,
-                            smooth_ms=50.0):
+                            smooth_ms=50.0,
+                            mode='block'):
     """
-    Extract LFP deflection signal suitable for event detection.
-
-    Strategy
-    --------
-    1. Bandpass filter (default 1-100 Hz).
-    2. Compute PC1 across channels (captures global state changes).
-    3. Smooth and z-score → lfp_pc1_z.
-
-    Returns
-    -------
-    lfp_time   : time vector (seconds from recording start)
-    lfp_pc1_z  : smoothed, z-scored PC1 trace
-    lfp_pc1    : raw (unsmoothed) PC1
-    explained  : explained variance ratios
+    mode='random': original behavior (1 trace)
+    mode='block': independent traces for each 20-channel block
+    mode='global': PCA across all channels simultaneously
+    mode='both': outputs BOTH the global trace and all individual block traces
     """
     n_ch, n_samp = lf_data.shape
-
-    # Bandpass filter
     lo, hi = bandpass
-    sos = butter(4, [lo / (sr_lf/2), hi / (sr_lf/2)],
-                 btype='band', output='sos')
-    # Filter a subset of channels for speed
-    rng = np.random.RandomState(42)
-    ch_idx = (rng.choice(n_ch, min(n_ch, n_channels_pca), replace=False)
-               if n_ch > n_channels_pca else np.arange(n_ch))
-    filt = np.zeros((len(ch_idx), n_samp), dtype=float)
-    for ii, ci in enumerate(ch_idx):
-        filt[ii] = sosfiltfilt(sos, lf_data[ci].astype(float))
-
-    # PCA
-    sc = StandardScaler()
-    Xs = sc.fit_transform(filt.T)   # (n_samp, n_ch_subset)
-    pca = PCA(n_components=min(10, Xs.shape[1]))
-    Z = pca.fit_transform(Xs)
-    explained = pca.explained_variance_ratio_
-    pc1 = Z[:, 0]
-
-    # Smooth
+    sos = butter(4, [lo / (sr_lf/2), hi / (sr_lf/2)], btype='band', output='sos')
     wf = odd_int(max(1, int(smooth_ms / 1000.0 * sr_lf)))
-    pc1_smooth = safe_medfilt(pc1, wf)
-
-    # Normalize and z-score
-    pc1_norm = normalize01(pc1_smooth)
-    m, s = np.nanmean(pc1_norm), np.nanstd(pc1_norm)
-    pc1_z = (pc1_norm - m) / (s if s > 0 else 1.0)
-
     lfp_time = np.arange(n_samp) / sr_lf
-    return lfp_time, pc1_z, pc1, explained
+    
+    out_traces = {}
 
+    if mode == 'random':
+        rng = np.random.RandomState(42)
+        ch_idx = (rng.choice(n_ch, min(n_ch, n_channels_pca), replace=False)
+                   if n_ch > n_channels_pca else np.arange(n_ch))
+        filt = np.zeros((len(ch_idx), n_samp), dtype=float)
+        for ii, ci in enumerate(ch_idx):
+            filt[ii] = sosfiltfilt(sos, lf_data[ci].astype(float))
 
+        sc = StandardScaler()
+        Xs = sc.fit_transform(filt.T)
+        pca = PCA(n_components=1)
+        pc1 = pca.fit_transform(Xs)[:, 0]
+        
+        pc1_smooth = safe_medfilt(pc1, wf)
+        pc1_norm = normalize01(pc1_smooth)
+        m, s = np.nanmean(pc1_norm), np.nanstd(pc1_norm)
+        out_traces['lfp_deflection'] = (pc1_norm - m) / (s if s > 0 else 1.0)
+
+    elif mode == 'global':
+        filt = np.zeros_like(lf_data, dtype=float)
+        for ii in range(n_ch):
+            filt[ii] = sosfiltfilt(sos, lf_data[ii].astype(float))
+            
+        sc = StandardScaler()
+        Xs = sc.fit_transform(filt.T)
+        pca = PCA(n_components=1)
+        global_pc1 = pca.fit_transform(Xs)[:, 0]
+        
+        global_med = np.median(filt, axis=0)
+        if np.corrcoef(global_pc1, global_med)[0, 1] < 0:
+            global_pc1 = -global_pc1
+            
+        pc1_smooth = safe_medfilt(global_pc1, wf)
+        pc1_norm = normalize01(pc1_smooth)
+        m, s = np.nanmean(pc1_norm), np.nanstd(pc1_norm)
+        out_traces['lfp_global'] = (pc1_norm - m) / (s if s > 0 else 1.0)
+
+    elif mode == 'block':
+        block_size = max(2, int(n_channels_pca))
+        block_idx = 0
+        
+        for start in range(0, max(1, n_ch - block_size + 1), block_size):
+            blk = lf_data[start:start + block_size, :]
+            if blk.shape[0] >= 4:
+                filt = np.zeros_like(blk, dtype=float)
+                for ii in range(blk.shape[0]):
+                    filt[ii] = sosfiltfilt(sos, blk[ii].astype(float))
+                
+                sc = StandardScaler()
+                Xs = sc.fit_transform(filt.T)
+                pca = PCA(n_components=1)
+                block_pc1 = pca.fit_transform(Xs)[:, 0]
+                
+                block_med = np.median(filt, axis=0)
+                if np.corrcoef(block_pc1, block_med)[0, 1] < 0:
+                    block_pc1 = -block_pc1
+                    
+                pc1_smooth = safe_medfilt(block_pc1, wf)
+                pc1_norm = normalize01(pc1_smooth)
+                m, s = np.nanmean(pc1_norm), np.nanstd(pc1_norm)
+                out_traces[f'lfp_block_{block_idx}'] = (pc1_norm - m) / (s if s > 0 else 1.0)
+                block_idx += 1
+
+    elif mode == 'both':
+        # Filter all channels once for maximum efficiency
+        filt = np.zeros_like(lf_data, dtype=float)
+        for ii in range(n_ch):
+            filt[ii] = sosfiltfilt(sos, lf_data[ii].astype(float))
+            
+        # 1. Compute Global PC1
+        sc_glob = StandardScaler()
+        Xs_glob = sc_glob.fit_transform(filt.T)
+        pca_glob = PCA(n_components=1)
+        global_pc1 = pca_glob.fit_transform(Xs_glob)[:, 0]
+        
+        global_med = np.median(filt, axis=0)
+        if np.corrcoef(global_pc1, global_med)[0, 1] < 0:
+            global_pc1 = -global_pc1
+            
+        pc1_smooth_glob = safe_medfilt(global_pc1, wf)
+        pc1_norm_glob = normalize01(pc1_smooth_glob)
+        m, s = np.nanmean(pc1_norm_glob), np.nanstd(pc1_norm_glob)
+        out_traces['lfp_global'] = (pc1_norm_glob - m) / (s if s > 0 else 1.0)
+        
+        # 2. Compute Block PC1s using the already-filtered data
+        block_size = max(2, int(n_channels_pca))
+        block_idx = 0
+        for start in range(0, max(1, n_ch - block_size + 1), block_size):
+            blk_filt = filt[start:start + block_size, :]
+            if blk_filt.shape[0] >= 4:
+                sc_blk = StandardScaler()
+                Xs_blk = sc_blk.fit_transform(blk_filt.T)
+                pca_blk = PCA(n_components=1)
+                block_pc1 = pca_blk.fit_transform(Xs_blk)[:, 0]
+                
+                block_med = np.median(blk_filt, axis=0)
+                if np.corrcoef(block_pc1, block_med)[0, 1] < 0:
+                    block_pc1 = -block_pc1
+                    
+                pc1_smooth_blk = safe_medfilt(block_pc1, wf)
+                pc1_norm_blk = normalize01(pc1_smooth_blk)
+                m, s = np.nanmean(pc1_norm_blk), np.nanstd(pc1_norm_blk)
+                out_traces[f'lfp_block_{block_idx}'] = (pc1_norm_blk - m) / (s if s > 0 else 1.0)
+                block_idx += 1
+    else:
+        raise ValueError(f"Unknown lfp_mode: {mode}")
+
+    return lfp_time, out_traces
 # ──────────────────────────────────────────────────────────────────────────────
 # FEATURE 3 — MUA envelope
 # Rising edge of multi-unit activity when mouse initiates movement.
@@ -1096,6 +1195,7 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
                         chunk_sec=60.0,
                         min_candidates=2,
                         solenoid_mode='global',
+                        lfp_mode='both',
                         use_cache=True,
                         analysis_only=False,
                         verbose=True):
@@ -1143,7 +1243,7 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
     feature_times  = {}
 
     session_stem_for_cache = Path(ap_bin or lf_bin or bhv_file).stem
-    cache_path = Path(out_folder) / f"{session_stem_for_cache}_{solenoid_mode}_features_cache.npz"
+    cache_path = Path(out_folder) / f"{session_stem_for_cache}_features_cache.npz"
 
     sync_edge_times_cached = None
     cache_loaded = False
@@ -1199,7 +1299,11 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
             overlap_samp = int(0.5 * sr_ap)
             ds_factor    = max(1, int(sr_ap / 1000.0))
 
-            cm_chunks, mua_chunks = [], []
+            if solenoid_mode == 'all':
+                cm_chunks = {'global': [], 'block': [], 'derivative': []}
+            else:
+                cm_chunks = []
+            mua_chunks = []
 
             do_solenoid = 'solenoid_artifact' in feature_list
             do_mua      = 'mua_envelope'      in feature_list
@@ -1221,31 +1325,33 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
                 chunk = (chunk * uv_ap).astype(np.float32)
 
                 if do_solenoid:
-                    if solenoid_mode == 'global':
-                        sol_raw = np.median(chunk, axis=0).astype(np.float64)
+                    # Helper functions for the 3 modes
+                    def calc_global(chk): return np.median(chk, axis=0).astype(np.float64)
+                    
+                    def calc_block(chk):
+                        b_tr = []
+                        for st in range(0, max(1, chk.shape[0] - 31), 16):
+                            b = chk[st:st + 32, :]
+                            if b.shape[0] >= 8: b_tr.append(np.median(b, axis=0).astype(np.float64))
+                        return calc_global(chk) if not b_tr else np.median(np.vstack(b_tr), axis=0).astype(np.float64)
+                        
+                    def calc_deriv(chk):
+                        base = calc_global(chk)
+                        return np.abs(np.diff(base, prepend=base[0]))
 
-                    elif solenoid_mode == 'block':
-                        block_size = 32
-                        block_stride = 16
-                        block_traces = []
-                        for start in range(0, max(1, chunk.shape[0] - block_size + 1), block_stride):
-                            blk = chunk[start:start + block_size, :]
-                            if blk.shape[0] >= 8:
-                                block_traces.append(np.median(blk, axis=0).astype(np.float64))
-                        if len(block_traces) == 0:
-                            sol_raw = np.median(chunk, axis=0).astype(np.float64)
-                        else:
-                            sol_raw = np.median(np.vstack(block_traces), axis=0).astype(np.float64)
-
-                    elif solenoid_mode == 'derivative':
-                        base = np.median(chunk, axis=0).astype(np.float64)
-                        sol_raw = np.abs(np.diff(base, prepend=base[0]))
-
+                    # Execute all 3 simultaneously if requested
+                    if solenoid_mode == 'all':
+                        sg, sb, sd = calc_global(chunk), calc_block(chunk), calc_deriv(chunk)
+                        end_pad = len(sg) - post_pad if post_pad > 0 else None
+                        cm_chunks['global'].append(sg[pre_pad:end_pad])
+                        cm_chunks['block'].append(sb[pre_pad:end_pad])
+                        cm_chunks['derivative'].append(sd[pre_pad:end_pad])
                     else:
-                        raise ValueError(f"Unknown solenoid_mode: {solenoid_mode}")
-
-                    end_idx = len(sol_raw) - post_pad if post_pad > 0 else None
-                    cm_chunks.append(sol_raw[pre_pad:end_idx])
+                        if solenoid_mode == 'global': sol_raw = calc_global(chunk)
+                        elif solenoid_mode == 'block': sol_raw = calc_block(chunk)
+                        elif solenoid_mode == 'derivative': sol_raw = calc_deriv(chunk)
+                        end_pad = len(sol_raw) - post_pad if post_pad > 0 else None
+                        cm_chunks.append(sol_raw[pre_pad:end_pad])
 
                 if do_mua:
                     _, _, mua_raw = extract_mua_envelope(chunk, sr_ap)
@@ -1257,19 +1363,34 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
                 del chunk
 
             if do_solenoid:
-                cm_full = np.concatenate(cm_chunks)
-                abs_cm  = np.abs(cm_full)
-                mu, sd  = np.nanmean(abs_cm), np.nanstd(abs_cm)
-                cm_z    = (abs_cm - mu) / (sd if sd > 0 else 1.0)
-                t_art   = np.arange(len(cm_z)) / sr_ap
                 min_dist_samp = int(0.1 * sr_ap)
-                ev_samp, _ = find_peaks(cm_z, height=8.0, distance=min_dist_samp)
-                
-                feature_traces['solenoid_artifact'] = cm_z
-                feature_times['solenoid_artifact']  = t_art
-                if verbose:
-                    print(f"[FEAT] solenoid({solenoid_mode}): {len(ev_samp)} candidate events")
-                del cm_full, cm_chunks
+                if solenoid_mode == 'all':
+                    for smode in ['global', 'block', 'derivative']:
+                        cm_full = np.concatenate(cm_chunks[smode])
+                        abs_cm  = np.abs(cm_full)
+                        mu, sd  = np.nanmean(abs_cm), np.nanstd(abs_cm)
+                        cm_z    = (abs_cm - mu) / (sd if sd > 0 else 1.0)
+                        t_art   = np.arange(len(cm_z)) / sr_ap
+                        ev_samp, _ = find_peaks(cm_z, height=8.0, distance=min_dist_samp)
+                        
+                        feature_traces[f'solenoid_{smode}'] = cm_z
+                        feature_times[f'solenoid_{smode}']  = t_art
+                        if verbose:
+                            print(f"[FEAT] solenoid({smode}): {len(ev_samp)} candidate events")
+                    del cm_chunks
+                else:
+                    cm_full = np.concatenate(cm_chunks)
+                    abs_cm  = np.abs(cm_full)
+                    mu, sd  = np.nanmean(abs_cm), np.nanstd(abs_cm)
+                    cm_z    = (abs_cm - mu) / (sd if sd > 0 else 1.0)
+                    t_art   = np.arange(len(cm_z)) / sr_ap
+                    ev_samp, _ = find_peaks(cm_z, height=8.0, distance=min_dist_samp)
+                    
+                    feature_traces['solenoid_artifact'] = cm_z
+                    feature_times['solenoid_artifact']  = t_art
+                    if verbose:
+                        print(f"[FEAT] solenoid({solenoid_mode}): {len(ev_samp)} candidate events")
+                    del cm_full, cm_chunks
 
             if do_mua:
                 mua_full = np.concatenate(mua_chunks)
@@ -1281,6 +1402,19 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
 
         except Exception as e:
             warnings.warn(f"AP extraction failed: {e}")
+        finally:
+            # Save AP features to cache immediately — even if LF hasn't run yet.
+            # This means a crash during LF won't lose the AP work.
+            if use_cache and any(k in feature_traces
+                                  for k in ('solenoid_global', 'solenoid_block',
+                                            'solenoid_derivative', 'solenoid_artifact',
+                                            'mua_envelope')):
+                try:
+                    update_feature_cache(cache_path, feature_traces, feature_times)
+                    if verbose:
+                        print(f"[CACHE] AP features saved → {cache_path.name}")
+                except Exception as ce:
+                    warnings.warn(f"AP cache save failed: {ce}")
 
     # ── LF extraction ─────────────────────────────────────────────────────
     if need_lf:
@@ -1299,10 +1433,10 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
             lf_data = (lf_data * uv_lf).astype(np.float32)
 
             if 'lfp_deflection' in feature_list:
-                lf_t, lf_z, _, _ = extract_lfp_deflection(lf_data, sr_lf)
-                feature_traces['lfp_deflection'] = lf_z
-                feature_times['lfp_deflection']  = lf_t
-
+                lf_t, lfp_dict = extract_lfp_deflection(lf_data, sr_lf, mode=lfp_mode)
+                for blk_name, blk_z in lfp_dict.items():
+                    feature_traces[blk_name] = blk_z
+                    feature_times[blk_name]  = lf_t
             if 'lick_band' in feature_list:
                 lk_t, lk_z, _ = extract_lick_band(lf_data, sr_lf)
                 feature_traces['lick_band'] = lk_z
@@ -1310,6 +1444,17 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
 
         except Exception as e:
             warnings.warn(f"LF extraction failed: {e}")
+        finally:
+            # Save LF features into cache immediately after extraction.
+            if use_cache and any(k in feature_traces
+                                  for k in ('lfp_deflection', 'lick_band',
+                                            'lfp_global', 'lfp_regional')):
+                try:
+                    update_feature_cache(cache_path, feature_traces, feature_times)
+                    if verbose:
+                        print(f"[CACHE] LF features saved → {cache_path.name}")
+                except Exception as ce:
+                    warnings.warn(f"LF cache save failed: {ce}")
 
     if not feature_traces:
         raise RuntimeError("No features extracted.")
@@ -1377,7 +1522,9 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
     # ── Save sync ─────────────────────────────────────────────────────────
     if make_sync:
         session_stem = Path(ap_bin or lf_bin or bhv_file).stem
-        sync_out = out_folder / f"sync_ephys_{session_stem}.json"
+        # Get the name of the specific output folder (e.g., "lfp_deflection")
+        run_name = out_folder.name 
+        sync_out = out_folder / f"{run_name}_sync_ephys_{session_stem}.json"
 
         write_sync_file(
             str(sync_out),
@@ -1406,6 +1553,10 @@ if __name__ == '__main__':
     # Input files
     parser.add_argument('--bhv', required=True,
                         help='Behavior log CSV (GlobalLog*.csv)')
+    parser.add_argument('--solenoid-mode', default='global',
+                    choices=['global', 'block', 'derivative', 'all'],
+                    help='Solenoid extraction variant to use.')
+    
     parser.add_argument('--ap',  default=None,
                         help='SpikeGLX AP band binary (*.ap.bin)')
     parser.add_argument('--lf',  default=None,
@@ -1454,9 +1605,13 @@ if __name__ == '__main__':
                              'confidence score. Trials with fewer candidates are '
                              'rejected (confidence 1.0 from single candidate is '
                              'uninformative). Default 2.')
-    parser.add_argument('--solenoid-mode', default='global',
-                    choices=['global', 'block', 'derivative'],
-                    help='Solenoid extraction variant to use.')
+    
+    parser.add_argument('--extract-only', action='store_true',
+                        help='Extract all features and save cache, then exit. '
+                             'Run this ONCE on a new session before any analysis.')
+    parser.add_argument('--lfp-mode', default='both',
+                    choices=['random', 'block', 'global', 'both'],
+                    help='LFP extraction variant to use.')
     args = parser.parse_args()
 
     # Parse channel lists
@@ -1490,11 +1645,16 @@ if __name__ == '__main__':
     lf_channels    = lf_ch,
     chunk_sec      = args.chunk_sec,
     min_candidates = args.min_candidates,
-    use_cache      = not args.no_cache,
-    analysis_only  = args.analysis_only,
     solenoid_mode  = args.solenoid_mode,
+    lfp_mode       = args.lfp_mode,
+    use_cache      = not args.no_cache,
+    analysis_only  = args.analysis_only or args.extract_only,
     verbose        = True,
 )
+    if args.extract_only:
+        print("[DONE] Extraction complete. Cache saved. "
+              "Re-run without --extract-only to run alignment.")
+        import sys; sys.exit(0)
     if args.sweep:
         out_folder = args.out or str(Path(args.bhv).parent)
         csv_path = hyperparameter_sweep(
