@@ -194,7 +194,13 @@ def read_spikeglx_meta(bin_path):
     """Parse companion .meta file and return dict.
     Handles both file.ap.bin→file.ap.meta and file.ap→file.ap.meta naming.
     """
+    import sys as _sys
     bin_path = Path(bin_path)
+    
+    # Resolve to absolute path first to avoid Windows 260-char limit
+    if _sys.platform == 'win32':
+        bin_path = Path(bin_path).resolve()
+        
     # Case 1: file.ap.bin → file.ap.meta  (replace .bin suffix)
     meta_path = bin_path.with_suffix('.meta')
     if not meta_path.exists():
@@ -205,6 +211,7 @@ def read_spikeglx_meta(bin_path):
             f"Meta file not found. Tried:\n"
             f"  {bin_path.with_suffix('.meta')}\n"
             f"  {str(bin_path) + '.meta'}")
+            
     meta = {}
     with open(meta_path, 'r') as f:
         for line in f:
@@ -260,7 +267,13 @@ def load_ephys_chunk(bin_path, start_sample, end_sample,
     itemsize = np.dtype(dtype).itemsize
     byte_offset = start_sample * n_ch * itemsize
 
-    mm = np.memmap(bin_path, dtype=dtype, mode='r',
+    # Windows MAX_PATH workaround: prepend \\?\ for paths > 240 chars
+    import sys as _sys
+    _bin_str = str(bin_path)
+    if _sys.platform == 'win32' and len(_bin_str) > 240:
+        if not _bin_str.startswith('\\\\?\\'):
+            _bin_str = '\\\\?\\' + str(Path(bin_path).resolve())
+    mm = np.memmap(_bin_str, dtype=dtype, mode='r',
                    offset=byte_offset,
                    shape=(n_samples_to_read, n_ch))
 
@@ -1308,7 +1321,13 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
             do_solenoid = 'solenoid_artifact' in feature_list
             do_mua      = 'mua_envelope'      in feature_list
 
+            if n_samp_ap == 0:
+                warnings.warn(f"AP file appears empty (0 samples): {Path(ap_bin).name}")
+                raise RuntimeError("Empty AP file")
+
             n_chunks = int(np.ceil(n_samp_ap / chunk_samp))
+            if n_chunks == 0:
+                raise RuntimeError(f"No chunks to process (n_samp_ap={n_samp_ap})")
 
             for ci in range(n_chunks):
                 core_start = ci * chunk_samp
@@ -1428,17 +1447,88 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
             if lf_channels is None:
                 lf_channels = list(range(n_ch_lf - 1))
 
-            lf_data = load_ephys_chunk(lf_bin, 0, n_samp_lf,
-                                      channel_ids=lf_channels)
-            lf_data = (lf_data * uv_lf).astype(np.float32)
+            # LF is 2500 Hz × 384 ch — still several GB, load in chunks
+            lf_chunk_samp   = int(chunk_sec * sr_lf)
+            lf_overlap_samp = int(2.0 * sr_lf)   # 2s overlap for filter settling
+            n_lf_chunks     = int(np.ceil(n_samp_lf / lf_chunk_samp))
 
-            if 'lfp_deflection' in feature_list:
-                lf_t, lfp_dict = extract_lfp_deflection(lf_data, sr_lf, mode=lfp_mode)
-                for blk_name, blk_z in lfp_dict.items():
-                    feature_traces[blk_name] = blk_z
-                    feature_times[blk_name]  = lf_t
-            if 'lick_band' in feature_list:
-                lk_t, lk_z, _ = extract_lick_band(lf_data, sr_lf)
+            size_lf_gb = len(lf_channels) * n_samp_lf * 2 / 1e9
+            if verbose:
+                print(f"[LF] {n_ch_lf} ch, {sr_lf:.0f} Hz, "
+                      f"{n_samp_lf/sr_lf:.0f} s — using {len(lf_channels)} ch "
+                      f"({size_lf_gb:.1f} GB) — chunked @ {chunk_sec}s")
+
+            do_lfp   = 'lfp_deflection' in feature_list
+            do_lick  = 'lick_band'       in feature_list
+
+            # Accumulators: collect per-chunk PCA scores / lick envelopes,
+            # then concatenate and z-score globally.
+            lfp_chunk_bufs  = {}   # key → list of 1-D arrays
+            lick_chunks     = []
+
+            for ci in range(n_lf_chunks):
+                core_start = ci * lf_chunk_samp
+                core_end   = min(n_samp_lf, core_start + lf_chunk_samp)
+                load_start = max(0, core_start - lf_overlap_samp)
+                load_end   = min(n_samp_lf, core_end + lf_overlap_samp)
+                pre_pad    = core_start - load_start
+                post_pad   = load_end   - core_end
+
+                if verbose:
+                    pct = 100.0 * core_end / n_samp_lf
+                    print(f"[LF] chunk {ci+1}/{n_lf_chunks}  "
+                          f"{core_start/sr_lf/60:.1f}–{core_end/sr_lf/60:.1f} min  "
+                          f"({pct:.0f}%)", end='\r', flush=True)
+
+                chunk = load_ephys_chunk(lf_bin, load_start, load_end,
+                                          channel_ids=lf_channels)
+                chunk = (chunk * uv_lf).astype(np.float32)
+
+                if do_lfp:
+                    _, lfp_dict_c = extract_lfp_deflection(chunk, sr_lf,
+                                                            mode=lfp_mode)
+                    for bname, bz in lfp_dict_c.items():
+                        end_i = len(bz) - post_pad if post_pad > 0 else None
+                        seg   = bz[pre_pad:end_i]
+                        if bname not in lfp_chunk_bufs:
+                            lfp_chunk_bufs[bname] = []
+                        lfp_chunk_bufs[bname].append(seg)
+
+                if do_lick:
+                    _, lk_z_c, _ = extract_lick_band(chunk, sr_lf)
+                    end_i = len(lk_z_c) - post_pad if post_pad > 0 else None
+                    lick_chunks.append(lk_z_c[pre_pad:end_i])
+
+                del chunk
+
+            if verbose:
+                print()  # newline after \r
+
+            if do_lfp and lfp_chunk_bufs:
+                lf_total_samp = n_samp_lf
+                lf_t = np.arange(lf_total_samp) / sr_lf
+                for bname, segs in lfp_chunk_bufs.items():
+                    full = np.concatenate(segs)
+                    mu, sd = np.nanmean(full), np.nanstd(full)
+                    full_z = (full - mu) / (sd if sd > 0 else 1.0)
+                    # Trim/pad to exactly n_samp_lf
+                    if len(full_z) > lf_total_samp:
+                        full_z = full_z[:lf_total_samp]
+                    elif len(full_z) < lf_total_samp:
+                        full_z = np.pad(full_z,
+                                        (0, lf_total_samp - len(full_z)),
+                                        constant_values=0.0)
+                    feature_traces[bname] = full_z
+                    feature_times[bname]  = lf_t
+                if verbose:
+                    print(f"[FEAT] LFP ({lfp_mode}): "
+                          f"{list(lfp_chunk_bufs.keys())}")
+
+            if do_lick and lick_chunks:
+                lk_full = np.concatenate(lick_chunks)
+                mu, sd  = np.nanmean(lk_full), np.nanstd(lk_full)
+                lk_z    = (lk_full - mu) / (sd if sd > 0 else 1.0)
+                lk_t    = np.arange(len(lk_z)) / sr_lf
                 feature_traces['lick_band'] = lk_z
                 feature_times['lick_band']  = lk_t
 
@@ -1467,7 +1557,7 @@ def process_one_session(bhv_file, ap_bin=None, lf_bin=None, ks_folder=None,
             feature_times[fname],
             trial_rwd_times,
             search_window=(-0.1, 0.5),
-            peak_prominence=1.0,
+            peak_prominence=2.5,   # was 1.0 — too low, gave fake hit_rate~1.0
             peak_distance_s=0.15
         )
 
