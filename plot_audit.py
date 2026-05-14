@@ -57,6 +57,18 @@ def load_bhv(bhv_path):
         df = df.dropna(subset=['timestamp', 'code'])
     except Exception:
         pass
+        
+    # --- THE FIX: Zero the behavior clock ---
+    sr_mask = df['code'] == 1000
+    if sr_mask.any():
+        t0 = float(df['timestamp'][sr_mask].iloc[0])
+        df['timestamp'] = df['timestamp'] - t0
+    else:
+        # Fallback if code 1000 is missing: subtract the very first timestamp
+        t0 = float(df['timestamp'].iloc[0])
+        df['timestamp'] = df['timestamp'] - t0
+    # ----------------------------------------
+
     reward_times = df['timestamp'][df['code'] == 3].values.astype(float)
     return df, reward_times
 
