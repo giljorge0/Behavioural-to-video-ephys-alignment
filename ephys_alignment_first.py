@@ -617,9 +617,9 @@ def extract_lfp_deflection(lf_data, sr_lf, uv_per_bit=1.0,
         pc1 = pca.fit_transform(Xs)[:, 0]
         
         pc1_smooth = safe_medfilt(pc1, wf)
-        pc1_norm = normalize01(pc1_smooth)
-        m, s = np.nanmean(pc1_norm), np.nanstd(pc1_norm)
-        out_traces['lfp_deflection'] = (pc1_norm - m) / (s if s > 0 else 1.0)
+        m = np.nanmedian(pc1_smooth)
+        s = np.nanstd(pc1_smooth)
+        out_traces['lfp_deflection'] = (pc1_smooth - m) / (s if s > 0 else 1.0)
 
     elif mode == 'global':
         filt = np.zeros_like(lf_data, dtype=float)
@@ -636,9 +636,9 @@ def extract_lfp_deflection(lf_data, sr_lf, uv_per_bit=1.0,
             global_pc1 = -global_pc1
             
         pc1_smooth = safe_medfilt(global_pc1, wf)
-        pc1_norm = normalize01(pc1_smooth)
-        m, s = np.nanmean(pc1_norm), np.nanstd(pc1_norm)
-        out_traces['lfp_global'] = (pc1_norm - m) / (s if s > 0 else 1.0)
+        m = np.nanmedian(pc1_smooth)
+        s = np.nanstd(pc1_smooth)
+        out_traces['lfp_global'] = (pc1_smooth - m) / (s if s > 0 else 1.0)
 
     elif mode == 'block':
         block_size = max(2, int(n_channels_pca))
@@ -661,9 +661,9 @@ def extract_lfp_deflection(lf_data, sr_lf, uv_per_bit=1.0,
                     block_pc1 = -block_pc1
                     
                 pc1_smooth = safe_medfilt(block_pc1, wf)
-                pc1_norm = normalize01(pc1_smooth)
-                m, s = np.nanmean(pc1_norm), np.nanstd(pc1_norm)
-                out_traces[f'lfp_block_{block_idx}'] = (pc1_norm - m) / (s if s > 0 else 1.0)
+                m = np.nanmedian(pc1_smooth)
+                s = np.nanstd(pc1_smooth)
+                out_traces[f'lfp_block_{block_idx}'] = (pc1_smooth - m) / (s if s > 0 else 1.0)
                 block_idx += 1
 
     elif mode == 'both':
@@ -683,9 +683,9 @@ def extract_lfp_deflection(lf_data, sr_lf, uv_per_bit=1.0,
             global_pc1 = -global_pc1
             
         pc1_smooth_glob = safe_medfilt(global_pc1, wf)
-        pc1_norm_glob = normalize01(pc1_smooth_glob)
-        m, s = np.nanmean(pc1_norm_glob), np.nanstd(pc1_norm_glob)
-        out_traces['lfp_global'] = (pc1_norm_glob - m) / (s if s > 0 else 1.0)
+        m = np.nanmedian(pc1_smooth_glob)
+        s = np.nanstd(pc1_smooth_glob)
+        out_traces['lfp_global'] = (pc1_smooth_glob - m) / (s if s > 0 else 1.0)
         
         # 2. Compute Block PC1s using the already-filtered data
         block_size = max(2, int(n_channels_pca))
@@ -703,9 +703,9 @@ def extract_lfp_deflection(lf_data, sr_lf, uv_per_bit=1.0,
                     block_pc1 = -block_pc1
                     
                 pc1_smooth_blk = safe_medfilt(block_pc1, wf)
-                pc1_norm_blk = normalize01(pc1_smooth_blk)
-                m, s = np.nanmean(pc1_norm_blk), np.nanstd(pc1_norm_blk)
-                out_traces[f'lfp_block_{block_idx}'] = (pc1_norm_blk - m) / (s if s > 0 else 1.0)
+                m = np.nanmedian(pc1_smooth_blk)
+                s = np.nanstd(pc1_smooth_blk)
+                out_traces[f'lfp_block_{block_idx}'] = (pc1_smooth_blk - m) / (s if s > 0 else 1.0)
                 block_idx += 1
     else:
         raise ValueError(f"Unknown lfp_mode: {mode}")
