@@ -147,88 +147,136 @@ def make_bandpass(lo, hi, sr):
 # Band definitions
 # ──────────────────────────────────────────────────────────────────────────────
 LFP_BANDS = {
-    'delta': (1.0,   4.0),
-    'theta': (4.0,   8.0),
-    'beta':  (8.0,  30.0),
-    'gamma': (30.0, 80.0),
+    # Classic bands
+    'delta':      (1.0,    4.0),
+    'theta':      (4.0,    8.0),
+    'alpha':      (8.0,   12.0),   # split from old 'beta'; sensory gating
+    'low_beta':   (12.0,  20.0),   # movement prep / suppression
+    'high_beta':  (20.0,  30.0),   # basal ganglia reward signature
+    'beta':       (8.0,   30.0),   # kept for backward compat
+    'gamma':      (30.0,  80.0),
+    'high_gamma': (80.0, 150.0),   # local spiking proxy, very spatially specific
+    'ripple':     (150.0, 250.0),  # sharp-wave ripples / consolidation
 }
 
 AP_BANDS = {
-    'mua':   (300.0, 3000.0),
-    'hfo':   (80.0,  200.0),
-    'gamma': (30.0,   80.0),
+    'gamma':    (30.0,   80.0),
+    'hfo':      (80.0,  200.0),
+    'mua':      (300.0, 3000.0),
+    'high_mua': (3000.0, 8000.0),  # high-freq spike tails missed by standard MUA
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LFP bands + PC1/PC2/PC3
+# Spatial filters  (applied BEFORE frequency filtering + PCA)
 # ──────────────────────────────────────────────────────────────────────────────
-def extract_lfp_bands_pcs(lf_path, sr_lf, n_ch_lf, n_pcs, band_names, block_size, chunk_sec, out_sr=1000.0):
-    n_ch_data = n_ch_lf - 1 
-    n_blocks  = max(1, (n_ch_data) // block_size)
+
+def apply_car(data):
+    """
+    Common Average Reference: subtract the global median across ALL channels
+    at every time point.  Kills volume-conducted movement artifacts that appear
+    identically on every channel.  Shape: (n_ch, n_samp) → same shape.
+    """
+    global_median = np.median(data, axis=0, keepdims=True)  # (1, n_samp)
+    return data - global_median
+
+def apply_bipolar(data):
+    """
+    Bipolar referencing: subtract adjacent channel from each channel.
+    Result has (n_ch - 1) channels.  Even more spatially local than CAR —
+    only activity within ~40-80µm survives.  Great for finding depth-specific
+    events that CAR might still let through.
+    Shape: (n_ch, n_samp) → (n_ch-1, n_samp)
+    """
+    return np.diff(data, axis=0)
+
+SPATIAL_FILTERS = {
+    'none':     lambda d: d,
+    'car':      apply_car,
+    'bipolar':  apply_bipolar,
+}
+
+
+def extract_lfp_bands_pcs(lf_path, sr_lf, n_ch_lf, n_pcs, band_names, block_size,
+                           chunk_sec, out_sr=1000.0, spatial_filter='none'):
+    """
+    spatial_filter: 'none' | 'car' | 'bipolar'
+      car     — subtract global median per timepoint (kills movement artifacts)
+      bipolar — subtract adjacent channels (only ~40-80µm local activity survives)
+    Feature names include suffix when spatial_filter != 'none':
+      lfp_block_0_gamma       (no filter)
+      lfp_block_0_gamma_car   (CAR)
+      lfp_block_0_gamma_bip   (bipolar)
+    """
+    sfx   = '' if spatial_filter == 'none' else f'_{spatial_filter[:3]}'
+    sfunc = SPATIAL_FILTERS.get(spatial_filter, lambda d: d)
+
+    n_ch_data  = n_ch_lf - 1
+    n_blocks   = max(1, n_ch_data // block_size)
     chunk_samp = int(chunk_sec * sr_lf)
     ds_factor  = max(1, int(sr_lf / out_sr))
     total_samp = int(Path(lf_path).stat().st_size // (n_ch_lf * 2))
-    
+
     out_traces = {}
     out_times  = {}
-    
+
     for band_name in band_names:
         if band_name not in LFP_BANDS:
             print(f'  [LFP BAND] Unknown band "{band_name}", skipping.')
             continue
         lo, hi = LFP_BANDS[band_name]
-        print(f'\n  [LFP BAND] {band_name} ({lo}-{hi} Hz), blocks 0-{n_blocks-1}, {n_pcs} PCs')
+        print(f'\n  [LFP BAND] {band_name} ({lo}-{hi} Hz) [{spatial_filter}], '
+              f'blocks 0-{n_blocks-1}, {n_pcs} PCs')
         try:
             sos = make_bandpass(lo, hi, sr_lf)
         except ValueError as e:
             print(f'    [SKIP] {e}')
             continue
-            
-        ipcas = [IncrementalPCA(n_components=min(n_pcs, block_size)) for _ in range(n_blocks)]
-        
+
+        ipcas = [IncrementalPCA(n_components=min(n_pcs, block_size))
+                 for _ in range(n_blocks)]
+
         # ── Pass 1: fit ──
         start = 0
         chunk_idx = 0
         n_chunks = int(np.ceil(total_samp / chunk_samp))
         while start < total_samp:
-            data = read_chunk(lf_path, n_ch_lf, start, chunk_samp)
+            data    = read_chunk(lf_path, n_ch_lf, start, chunk_samp)
+            data_sp = sfunc(data[:n_ch_data, :].astype(float))
             chunk_idx += 1
             print(f'    fit  chunk {chunk_idx}/{n_chunks}', end='\r')
             for bi in range(n_blocks):
                 ch0 = bi * block_size
-                ch1 = min(ch0 + block_size, n_ch_data)
-                blk = data[ch0:ch1, :]
+                ch1 = min(ch0 + block_size, data_sp.shape[0])
+                blk = data_sp[ch0:ch1, :]
                 if blk.shape[0] < 2: continue
                 filt = np.zeros_like(blk)
                 for ci in range(blk.shape[0]):
-                    filt[ci] = sosfiltfilt(sos, blk[ci].astype(float))
-                ds = filt[:, ::ds_factor].T
-                ipcas[bi].partial_fit(ds)
+                    filt[ci] = sosfiltfilt(sos, blk[ci])
+                ipcas[bi].partial_fit(filt[:, ::ds_factor].T)
             start += chunk_samp
         print()
-        
+
         # ── Pass 2: transform ──
         block_pcs = [[] for _ in range(n_blocks)]
         start = 0
         chunk_idx = 0
         while start < total_samp:
-            data = read_chunk(lf_path, n_ch_lf, start, chunk_samp)
+            data    = read_chunk(lf_path, n_ch_lf, start, chunk_samp)
+            data_sp = sfunc(data[:n_ch_data, :].astype(float))
             chunk_idx += 1
             print(f'    xfm  chunk {chunk_idx}/{n_chunks}', end='\r')
             for bi in range(n_blocks):
                 ch0 = bi * block_size
-                ch1 = min(ch0 + block_size, n_ch_data)
-                blk = data[ch0:ch1, :]
+                ch1 = min(ch0 + block_size, data_sp.shape[0])
+                blk = data_sp[ch0:ch1, :]
                 if blk.shape[0] < 2: continue
                 filt = np.zeros_like(blk)
                 for ci in range(blk.shape[0]):
-                    filt[ci] = sosfiltfilt(sos, blk[ci].astype(float))
-                ds = filt[:, ::ds_factor].T
-                projected = ipcas[bi].transform(ds)
-                block_pcs[bi].append(projected)
+                    filt[ci] = sosfiltfilt(sos, blk[ci])
+                block_pcs[bi].append(ipcas[bi].transform(filt[:, ::ds_factor].T))
             start += chunk_samp
         print()
-        
+
         # ── Assemble + store ──
         actual_sr = sr_lf / ds_factor
         for bi in range(n_blocks):
@@ -236,17 +284,17 @@ def extract_lfp_bands_pcs(lf_path, sr_lf, n_ch_lf, n_pcs, band_names, block_size
             assembled = np.vstack(block_pcs[bi])
             t_arr = np.arange(assembled.shape[0]) / actual_sr
             for pc_i in range(assembled.shape[1]):
-                pc_trace = assembled[:, pc_i].astype(np.float32)
-                pc_z = z_score(pc_trace)
+                pc_z = z_score(assembled[:, pc_i].astype(np.float32))
                 if pc_i == 0:
-                    fname = f'lfp_block_{bi}_{band_name}'
+                    fname = f'lfp_block_{bi}_{band_name}{sfx}'
                 else:
-                    fname = f'lfp_block_{bi}_{band_name}_pc{pc_i+1}'
+                    fname = f'lfp_block_{bi}_{band_name}_pc{pc_i+1}{sfx}'
                 out_traces[fname] = pc_z
                 out_times[fname]  = t_arr
                 print(f'    → {fname}  len={len(pc_z)}')
-                
+
     return out_traces, out_times
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # AP block bands (MUA / HFO / gamma) + PC1/PC2/PC3
@@ -514,6 +562,10 @@ def main():
     parser.add_argument('--ap',       default=None,                         help='SpikeGLX AP .bin file (required unless --skip-ap)')
     parser.add_argument('--lf',       default=None,                         help='SpikeGLX LF .bin file (required unless --skip-lfp)')
     parser.add_argument('--bhv',      default=None,                         help='GlobalLogInt*.csv (required for templates)')
+    parser.add_argument('--spatial-filters', nargs='+',
+                        default=['none', 'car'],
+                        help='Spatial filters to run for LFP bands: none car bipolar '
+                             '(default: none car — runs both and stores both)')
     parser.add_argument('--bands',    nargs='+', default=['delta', 'theta', 'beta', 'gamma'], help='LFP band names to extract (default: all 4)')
     parser.add_argument('--ap-bands', nargs='+', default=['mua', 'hfo', 'gamma'],             help='AP band names to extract (default: mua hfo gamma)')
     parser.add_argument('--n-pcs',    type=int, default=3,                  help='Number of PCs to extract per block (default: 3)')
@@ -556,12 +608,18 @@ def main():
             n_ch_lf, sr_lf, _, _ = get_bin_params(args.lf)
             sr_lf = sr_lf_cache if sr_lf_cache else sr_lf
             print(f'\nLF file: {Path(args.lf).name}  sr={sr_lf:.0f}Hz  n_ch={n_ch_lf}')
-            t, tm = extract_lfp_bands_pcs(
-                args.lf, sr_lf, n_ch_lf, n_pcs=args.n_pcs, band_names=args.bands, 
-                block_size=args.block_size, chunk_sec=args.chunk_sec, out_sr=args.out_sr)
-            all_new_traces.update(t)
-            all_new_times.update(tm)
-            print(f'\n  LFP bands: +{len(t)} features')
+            for sf in args.spatial_filters:
+                if sf not in SPATIAL_FILTERS:
+                    print(f'  [WARN] Unknown spatial filter "{sf}", skipping.')
+                    continue
+                t, tm = extract_lfp_bands_pcs(
+                    args.lf, sr_lf, n_ch_lf, n_pcs=args.n_pcs,
+                    band_names=args.bands,
+                    block_size=args.block_size, chunk_sec=args.chunk_sec,
+                    out_sr=args.out_sr, spatial_filter=sf)
+                all_new_traces.update(t)
+                all_new_times.update(tm)
+            print(f'\n  LFP bands: +{len(all_new_traces)} features so far')
             
     # ── AP block band extraction ──
     if not args.skip_ap_blocks:
