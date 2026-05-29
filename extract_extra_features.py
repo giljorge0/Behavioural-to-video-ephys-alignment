@@ -413,14 +413,10 @@ def fast_ncc(signal, template):
     ncc_trace = np.clip(ncc_trace, -1.0, 1.0)
     return ncc_trace.astype(np.float32)
 
-def build_template_features(cache_traces, cache_times, bhv_df, reward_code=2, pre_s=0.1, post_s=0.5, out_sr=1000.0, n_lfp_blocks_to_match=3):
+def build_template_features(cache_traces, cache_times, bhv_df, event_codes, pre_s=0.1, post_s=0.5, out_sr=1000.0, n_lfp_blocks_to_match=3):
     out_traces = {}
     out_times  = {}
-    rwd_times = bhv_df.loc[bhv_df['code'] == reward_code, 'timestamp'].values
-    if len(rwd_times) < 5:
-        print('  [TEMPLATE] Not enough reward events, skipping.')
-        return out_traces, out_times
-        
+    
     def infer_sr_from_times(t_arr):
         if t_arr is None or len(t_arr) < 2: return out_sr
         return 1.0 / float(np.median(np.diff(t_arr[:min(10000, len(t_arr))])))
@@ -449,45 +445,51 @@ def build_template_features(cache_traces, cache_times, bhv_df, reward_code=2, pr
             return np.vstack(windows)
         except ValueError:
             return np.empty((0, pre_n + post_n))
+
+    for code in event_codes:
+        print(f'\n  [TEMPLATE] --- Event Code {code} ---')
+        rwd_times = bhv_df.loc[bhv_df['code'] == code, 'timestamp'].values
+        if len(rwd_times) < 5:
+            print(f'    Not enough events (n={len(rwd_times)}), skipping.')
+            continue
             
-    def build_and_match(fname, trace, t_arr):
-        tr_ds, t_ds = resample_to(trace, t_arr, out_sr)
-        sr_ds = infer_sr_from_times(t_ds)
-        wins = extract_windows(tr_ds, t_ds, rwd_times, pre_s, post_s)
-        if wins.shape[0] < 5:
-            print(f'    [SKIP] {fname}: only {wins.shape[0]} windows')
-            return
-        template = wins.mean(axis=0)
-        print(f'    NCC: {fname}  template_len={len(template)}  n_trials={wins.shape[0]}  signal_len={len(tr_ds)}')
-        ncc = fast_ncc(tr_ds.astype(float), template.astype(float))
-        ncc_z = z_score(ncc)
-        key = f'tmpl_{fname}'
-        out_traces[key] = ncc_z
-        out_times[key]  = t_ds
-        print(f'    → {key}')
-        
-    # ── Solenoid derivative ──
-    if 'solenoid_derivative' in cache_traces:
-        t_arr = cache_times.get('solenoid_derivative')
-        if t_arr is None:
-            n = len(cache_traces['solenoid_derivative'])
-            t_arr = np.arange(n) / 30000.0
-        print('\n  [TEMPLATE] solenoid_derivative')
-        build_and_match('solenoid_derivative', cache_traces['solenoid_derivative'], t_arr)
-        
-    # ── Best LFP blocks ──
-    lfp_block_names = sorted(
-        [k for k in cache_traces if k.startswith('lfp_block_') and '_' not in k.replace('lfp_block_', '')],
-        key=lambda x: int(x.split('_')[-1])
-    )
-    for bi, bname in enumerate(lfp_block_names[:n_lfp_blocks_to_match]):
-        t_arr = cache_times.get(bname)
-        if t_arr is None:
-            n = len(cache_traces[bname])
-            t_arr = np.arange(n) / 2500.0
-        print(f'\n  [TEMPLATE] {bname}')
-        build_and_match(bname, cache_traces[bname], t_arr)
-        
+        def build_and_match(fname, trace, t_arr):
+            tr_ds, t_ds = resample_to(trace, t_arr, out_sr)
+            wins = extract_windows(tr_ds, t_ds, rwd_times, pre_s, post_s)
+            if wins.shape[0] < 5:
+                print(f'    [SKIP] {fname}: only {wins.shape[0]} windows')
+                return
+            template = wins.mean(axis=0)
+            print(f'    NCC: {fname}  template_len={len(template)}  n_trials={wins.shape[0]}')
+            ncc = fast_ncc(tr_ds.astype(float), template.astype(float))
+            ncc_z = z_score(ncc)
+            
+            # Incorporate the code into the cache key name
+            key = f'tmpl_c{code}_{fname}'
+            out_traces[key] = ncc_z
+            out_times[key]  = t_ds
+            print(f'    → {key}')
+            
+        # ── Solenoid derivative ──
+        if 'solenoid_derivative' in cache_traces:
+            t_arr = cache_times.get('solenoid_derivative')
+            if t_arr is None:
+                n = len(cache_traces['solenoid_derivative'])
+                t_arr = np.arange(n) / 30000.0
+            build_and_match('solenoid_derivative', cache_traces['solenoid_derivative'], t_arr)
+            
+        # ── Best LFP blocks ──
+        lfp_block_names = sorted(
+            [k for k in cache_traces if k.startswith('lfp_block_') and '_' not in k.replace('lfp_block_', '')],
+            key=lambda x: int(x.split('_')[-1])
+        )
+        for bname in lfp_block_names[:n_lfp_blocks_to_match]:
+            t_arr = cache_times.get(bname)
+            if t_arr is None:
+                n = len(cache_traces[bname])
+                t_arr = np.arange(n) / 2500.0
+            build_and_match(bname, cache_traces[bname], t_arr)
+            
     return out_traces, out_times
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -519,7 +521,7 @@ def main():
     parser.add_argument('--chunk-sec', type=float, default=60.0,            help='Seconds per read chunk (default: 60)')
     parser.add_argument('--out-sr',   type=float, default=1000.0,           help='Output sample rate for LFP/AP features (default: 1000 Hz)')
     parser.add_argument('--n-tmpl-blocks', type=int, default=3,             help='Number of LFP blocks to template-match (default: 3)')
-    
+    parser.add_argument('--tmpl-codes', type=int, nargs='+', default=[2, 31, 11, -11], help='Event codes to build templates for (default: 2 31 11 -11)')
     parser.add_argument('--skip-lfp-bands',      action='store_true')
     parser.add_argument('--skip-ap-blocks',      action='store_true')
     parser.add_argument('--skip-solenoid-depth', action='store_true')
@@ -602,13 +604,12 @@ def main():
             if not bhv_files or not bhv_files[0].exists():
                 bhv_files = [Path(args.bhv)]
             bhv_df = load_bhv(bhv_files[0])
-            n_rwd  = (bhv_df['code'] == 2).sum()
-            print(f'\n[TEMPLATE] BHV loaded: {n_rwd} reward events')
+            print(f'\n[TEMPLATE] BHV loaded. Searching for codes: {args.tmpl_codes}')
             
             combined = {**cache_traces, **all_new_traces}
             combined_t = {**cache_times, **all_new_times}
             t, tm = build_template_features(
-                combined, combined_t, bhv_df, n_lfp_blocks_to_match=args.n_tmpl_blocks)
+                combined, combined_t, bhv_df, event_codes=args.tmpl_codes, n_lfp_blocks_to_match=args.n_tmpl_blocks)
             all_new_traces.update(t)
             all_new_times.update(tm)
             print(f'\n  Templates: +{len(t)} features')
