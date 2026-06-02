@@ -81,12 +81,21 @@ def load_cache(path):
 
 
 def load_bhv(path):
-    """Load GlobalLogInt CSV; normalise timestamps to ephys-relative seconds."""
     df = pd.read_csv(str(path), header=None, names=['timestamp', 'code'])
     df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
     df['code']      = pd.to_numeric(df['code'],      errors='coerce')
     df = df.dropna()
-    df['timestamp'] = df['timestamp'] - df['timestamp'].min()
+    
+    # --- THE FIX: Zero the behavior clock to the Ephys Start Code ---
+    sr_mask = df['code'] == 1000
+    if sr_mask.any():
+        t0 = float(df['timestamp'][sr_mask].iloc[0])
+        df['timestamp'] = df['timestamp'] - t0
+    else:
+        # Fallback if code 1000 is missing
+        t0 = float(df['timestamp'].iloc[0])
+        df['timestamp'] = df['timestamp'] - t0
+        
     return df
 
 
@@ -97,19 +106,23 @@ def infer_sr(times_arr):
     return float(1.0 / np.median(np.diff(times_arr[:min(10000, len(times_arr))])))
 
 
-def get_times_for_feature(fname, traces, times):
+def get_times_for_feature(fname, traces, times, session_dur=None):
     """Return the time axis array for a feature, inferring SR if needed."""
     if fname in times:
         return times[fname]
-    # Reconstruct from trace length assuming common rates
     n = len(traces[fname])
-    # Guess: solenoid = 30kHz, LFP = 2500Hz, MUA = 1000Hz
-    if 'solenoid' in fname:
-        sr = 30000.0
-    elif 'lfp' in fname:
-        sr = 2500.0
+    # Best approach: infer from actual session duration (trace_len / session_s)
+    if session_dur and session_dur > 0:
+        sr = n / session_dur
     else:
-        sr = 1000.0
+        # Fallback heuristics when session_dur unavailable
+        # Values >10M are raw 30kHz AP; 3-5M are ~1kHz; 4-5M could be 1250Hz LF
+        if n > 10_000_000:
+            sr = 30000.0
+        elif n > 4_000_000:
+            sr = 1250.0
+        else:
+            sr = 1000.0
     return np.arange(n) / sr
 
 
@@ -347,6 +360,7 @@ def main():
     # ── Load behaviour ─────────────────────────────────────────────────────
     print(f'Loading behaviour: {Path(args.bhv).name}')
     bhv_df = load_bhv(args.bhv)
+    session_dur = float(bhv_df['timestamp'].max()) + 60.0   # last event + 60s margin
 
     # Print event counts in window
     for code, (label, _) in EVENT_CODES.items():
@@ -370,7 +384,7 @@ def main():
     for fname in feat_names:
         print(f'  ── {fname}')
         trace    = traces[fname]
-        time_arr = get_times_for_feature(fname, traces, times)
+        time_arr = get_times_for_feature(fname, traces, times, session_dur=session_dur)
 
         sr = infer_sr(time_arr)
         n_in_window = int((args.tmax - args.tmin) * sr)
