@@ -69,7 +69,8 @@ def load_bhv(bhv_path):
         df['timestamp'] = df['timestamp'] - t0
     # ----------------------------------------
 
-    reward_times = df['timestamp'][df['code'] == 3].values.astype(float)
+    target_code = 3 # Change this directly in the code to 31 or 11 to test Reach/Pull
+    reward_times = df['timestamp'][df['code'] == target_code].values.astype(float)
     return df, reward_times
 
 
@@ -280,12 +281,17 @@ def plot_feature(fname, trace, times, reward_times, out_folder,
         fig3.savefig(str(p3), dpi=120, bbox_inches='tight')
         plt.close(fig3)
         print(f"  Saved: {p3.name}")
-
+    precision = hits / len(peak_times) if len(peak_times) else 0.0
+    recall = trial_hit_rate if np.isfinite(trial_hit_rate) else 0.0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
     return {
         'feature': fname,
         'hit_rate': hit_rate,
         'false_peak_rate': false_rate,
         'median_error_ms': float(np.median(np.abs(errors_ms))) if len(errors_ms) else float('nan'),
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1_score,
         'n_hits': len(hit_times),
         'n_misses': len(miss_times),
         'n_peaks': len(peak_times),
@@ -361,8 +367,17 @@ def main():
 
     # Print summary table
     print("\n\n══ AUDIT SUMMARY ══")
-    print(f"{'feature':<25} {'hit_rate':>9} {'false_rate':>10} "
+    print(f"{'feature':<25} {'F1_SCORE':>9} {'hit_rate':>9} "
           f"{'med_err_ms':>11} {'n_hits':>7} {'n_peaks':>8}")
+    print('─' * 75)
+    # Sort by F1 Score descending (highest score is best)
+    for s in sorted(summaries, key=lambda x: x.get('f1_score', 0), reverse=True):
+        print(f"{s['feature']:<25} "
+              f"{s.get('f1_score', 0):>9.3f} "
+              f"{s['hit_rate']:>9.3f} "
+              f"{s['median_error_ms']:>11.1f} "
+              f"{s['n_hits']:>7} "
+              f"{s['n_peaks']:>8}")
     print('─' * 75)
     for s in sorted(summaries, key=lambda x: x['median_error_ms']):
         print(f"{s['feature']:<25} "
