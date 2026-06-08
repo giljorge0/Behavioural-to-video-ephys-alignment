@@ -15,12 +15,12 @@ In head-fixed reaching tasks, three independent clocks run simultaneously:
 | **Video** | High-speed camera (`Camera*.avi`) | 100–400 fps |
 | **Ephys** | Neuropixels / SpikeGLX (`.ap.bin` / `.lf.bin`) | 30 kHz (AP), 2.5 kHz (LF) |
 
-These clocks drift relative to each other. A single 75-minute session can accumulate more than 8 seconds of drift between the behaviour log and the camera. Without correction, trial-by-trial neural and kinematic analyses are misaligned by hundreds of milliseconds.
+These clocks drift relative to each other. A single 75-minute session can accumulate more than 8 seconds of drift. Without correction, trial-by-trial neural and kinematic analyses are misaligned by hundreds of milliseconds.
 
-This repository solves the problem by finding a **natural anchor event** visible in both the behaviour log and the electrophysiology — analogous to a clapperboard in film — and using it to fit a robust linear warp:
+This repository solves the problem by finding a **natural anchor event** visible in both the behaviour log and the electrophysiology — analogous to a clapperboard in film — and fitting a robust linear warp:
 
 ```
-corrected_ephys_time = stretch × behavior_time + offset
+ephys_time = stretch × behavior_time + offset
 ```
 
 ---
@@ -29,126 +29,211 @@ corrected_ephys_time = stretch × behavior_time + offset
 
 | File | Purpose |
 |---|---|
-| `ephys_alignment_first.py` | Main alignment pipeline |
-| `plot_audit.py` | Standalone visual validation tool (works from cache, no bin files needed) |
+| `ephys_alignment_fusion.py` | Main alignment pipeline (extraction + warp fitting) |
+| `extract_extra_features.py` | Extended features: LFP bands × PCs, AP bands × PCs, solenoid by depth, template matching |
+| `extract_better_features.py` | Advanced features: reward modulation index, CAR-MUA, spike density, phase-amplitude coupling |
+| `feature_explorer.py` | ERP-style visual audit of any cache across all event codes |
+| `plot_audit.py` | Threshold-sweep peak detection audit (works from cache, no bin files needed) |
+| `plot_individual_erps.py` | Per-event heatmap + mean trace, optionally warp-aligned via sync JSON |
 | `video_alignment_run_ready.py` | Video ↔ behaviour alignment (separate pipeline) |
 
 ---
 
-## Pipeline — Ephys ↔ Behaviour (`ephys_alignment_first.py`)
+## Workflow overview
 
-### How it works
-
-Four candidate features are extracted from the SpikeGLX binary files and evaluated independently. Each feature is a 1-D z-scored time series that should produce a detectable peak near every reward event:
-
-| Feature | Signal | Band | Best for |
-|---|---|---|---|
-| **Solenoid artifact** | Electromagnetic transient when reward valve fires | AP (30 kHz) | Hardware-level anchor; present on all channels simultaneously |
-| **LFP deflection** | Reward-triggered slow cortical potential; extracted via PCA | LF (1–100 Hz) | Best biological accuracy (~144 ms RMSE in validation) |
-| **MUA envelope** | Rising edge of multiunit spiking activity | AP (300–3000 Hz RMS) | Useful when LFP is absent; noisier |
-| **Lick-band power** | Rhythmic 5–8 Hz burst coinciding with reward licking | LF (5–8 Hz) | Speculative; rig-dependent |
-
-The pipeline runs in two phases:
-
-1. **Audit phase** — evaluates each feature independently. Reports hit rate (fraction of reward trials with a detectable peak), median timing error, and false peak rate. Lets you select the best feature before committing to alignment.
-2. **Alignment phase** — detects the best candidate event per trial, fits a Huber-robust linear warp on a training set, and evaluates on a held-out test set.
-
-### Validated results (Milka session 1)
-
-| Feature | RMSE | Notes |
-|---|---|---|
-| LFP deflection | **144 ms** | Best. Clear reward-evoked cortical potential. |
-| Solenoid (derivative) | 173 ms | Recommended fallback if LFP fails. |
-| Solenoid (global) | 176 ms | Reliable across all tested sessions. |
-| Solenoid (block) | 182 ms | Worse than global; depth-localised mode adds noise. |
-
----
-
-## Standard Operating Procedure (SOP) for overnight batch runs
-
-### Step 0 — Copy data to a local drive (critical for large files)
-
-Running the pipeline directly on `.bin` files stored in a live Dropbox Team Folder or deeply nested network drive **will crash** with `[Errno 22] Invalid argument`. There are two causes:
-
-- **Windows MAX\_PATH limit**: Windows blocks file access for paths longer than 260 characters. Dropbox paths routinely exceed this.
-- **Dropbox sync locks**: The Dropbox engine holds file locks on `.bin` files during sync, preventing `numpy.memmap` from opening them.
-
-**The fix** is to mirror the data locally before running:
-
-```powershell
-# Mirror one session folder to local disk (fast, skips already-copied files)
-robocopy "D:\Learning Lab Dropbox\..." "C:\data_temp\session1" /E /Z /MT:8
 ```
-
-Alternatively, map the Dropbox root to a short drive letter to duck under the path limit (no restart needed, resets on reboot):
-
-```powershell
-subst Z: "D:\Learning Lab Dropbox\Learning Lab Team Folder"
-# Now use Z:\Patlab protocols\... instead of the full path
+bin files + GlobalLog CSV
+        │
+        ▼
+ephys_alignment_fusion.py   ─── extraction + warp ──► sync_ephys_*.json / .mat
+        │
+        ├── extract_extra_features.py   (LFP bands, AP bands, templates)
+        └── extract_better_features.py  (RMI, CAR-MUA, SDF, PAC)
+                        │
+                        ▼
+              features_cache.npz
+                        │
+              ┌─────────┴──────────┐
+              ▼                    ▼
+     feature_explorer.py    plot_audit.py
+    (ERP grid per event)   (peak audit)
+              │
+              ▼
+     plot_individual_erps.py
+     (heatmap + mean trace,
+      warp-aligned)
 ```
 
 ---
 
-### Step 1 — Extract all features once (the slow step)
+## Standard Operating Procedure
 
-This reads the binary files, extracts all feature traces, and saves them to a lightweight `.npz` cache. **Run this once per session.** All subsequent runs load from cache instantly.
+### Step 0 — Copy data to a local drive
+
+Running against `.bin` files on a live Dropbox Team Folder **will crash** — two causes:
+
+- **Windows MAX\_PATH limit**: paths longer than 260 characters trigger `[Errno 22] Invalid argument`
+- **Dropbox sync locks**: the sync engine holds file locks that block `numpy`'s file reader
+
+Copy with robocopy (copies both `.bin` and `.meta`, which are both required):
 
 ```powershell
-python ephys_alignment_first.py `
-  --bhv  "C:\data_temp\session1\GlobalLogInt2023-08-15T11_14_10.csv" `
-  --ap   "C:\data_temp\session1\imec0\session_t0.imec0.ap.bin" `
-  --lf   "C:\data_temp\session1\imec0\session_t0.imec0.lf.bin" `
-  --out  "C:\results\session1_imec0" `
+robocopy "D:\Learning Lab Dropbox\...\session_imec0" "C:\data_temp\session_imec0" "*.bin" "*.meta" /MT:8 /Z /W:5 /R:3
+```
+
+---
+
+### Step 1 — Extract all features (the slow step, run once per session)
+
+```powershell
+python ephys_alignment_fusion.py `
+  --bhv  "C:\data_temp\GlobalLogInt*.csv" `
+  --ap   "C:\data_temp\session_imec0\*.ap.bin" `
+  --lf   "C:\data_temp\session_imec0\*.lf.bin" `
+  --out  "C:\results\session_imec0" `
   --feature all --solenoid-mode all --lfp-mode both `
-  --chunk-sec 60 `
-  --extract-only
+  --chunk-sec 30 `
+  --ap-channels 0,16,32,48,64,80,96,112,128,144,160,176,192,208,224,240,256,272,288,304,320,336,352,368 `
+  --lf-channels 0,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,264,272,280,288,296,304,312,320,328,336,344,352,360,368,376 `
+  --min-candidates 2 --make-sync --no-cache
 ```
 
-`--extract-only` exits after saving the cache without running alignment. Cache files are named `<stem>_features_cache.npz` and saved to `--out`.
+The 24-channel AP subset and 48-channel LF subset keep peak RAM at ~200 MB per chunk, preventing `[WinError 8] Not enough memory` on machines without a large page file. For solenoid (EM artifact, uniform across the probe) and LFP PCA, this subset is sufficient.
 
-**Typical runtimes:**
-- AP extraction (78 GB, 384 ch, 56 min): ~45–90 min
-- LF extraction (7 GB, 384 ch, 56 min): ~10–20 min
+**Cache file** is saved as `<stem>_features_cache.npz` in `--out`. All subsequent scripts load from this instantly.
+
+**Typical runtimes** (78 GB AP, 7 GB LF, 56 min session, 24/48 channels, chunk-sec 30):
+- AP extraction: ~30–60 min
+- LF extraction: ~5–15 min
 - All subsequent runs: seconds
 
 ---
 
-### Step 2 — Audit the features visually
+### Step 2 — Optionally add extended features
+
+**`extract_extra_features.py`** adds per-band × per-PC traces and template matching:
 
 ```powershell
-python plot_audit.py `
-  --cache "C:\results\session1_imec0\session_t0.imec0.ap_features_cache.npz" `
-  --bhv   "C:\data_temp\session1\GlobalLogInt2023-08-15T11_14_10.csv" `
-  --out   "C:\results\session1_imec0\audit_plots" `
-  --threshold 2.5
+python extract_extra_features.py `
+  --cache "C:\results\session_imec0\*_features_cache.npz" `
+  --ap    "C:\data_temp\session_imec0\*.ap.bin" `
+  --lf    "C:\data_temp\session_imec0\*.lf.bin" `
+  --bhv   "C:\data_temp\GlobalLogInt*.csv" `
+  --bands delta theta beta gamma `
+  --ap-bands mua hfo gamma `
+  --n-pcs 3 --block-size 20 --chunk-sec 60
 ```
 
-This produces three plots per feature (no bin files needed):
+New cache keys added: `lfp_block_N_<band>_pc{1,2,3}`, `ap_block_N_<band>_pc{1,2,3}`, `sol_depth_N`, `tmpl_<code>_<feature>`.
 
-- **Full session overview** — feature trace with reward times (red lines), detected peaks (blue dots), and the largest inter-reward interval highlighted in gold
-- **Zoom around largest ISI gap** — the most discriminative landmark for manual validation
-- **Error histogram** — distribution of detection latency relative to reward time
+**`extract_better_features.py`** adds four supervised/advanced feature families:
 
-Adjust `--threshold` to find where real biological peaks separate from noise. LFP features need threshold ≥ 2.5 after the z-scoring fix. Solenoid features typically need threshold ≥ 1.5.
+```powershell
+python extract_better_features.py `
+  --cache "C:\results\session_imec0\*_features_cache.npz" `
+  --ap    "C:\data_temp\session_imec0\*.ap.bin" `
+  --lf    "C:\data_temp\session_imec0\*.lf.bin" `
+  --bhv   "C:\data_temp\GlobalLogInt*.csv" `
+  --block-size 20 --chunk-sec 60 --n-pcs 3 --top-k 5
+```
+
+New cache keys added: `rmi_block_N_<band>_topK`, `car_block_N_<band>_pc{1,2,3}`, `sdf_block_N_pc{1,2,3}`, `pac_block_N`.
 
 ---
 
-### Step 3 — Run alignment with the best feature
+### Step 3 — Explore features visually on a 500 s chunk
+
+`feature_explorer.py` generates ERP-style plots for every feature in the cache. Each plot is a 2×2 grid (event codes 2, 31, 11, −11): individual trial traces overlaid in grey, mean ± SEM in black. A consistent shape = good feature. A flat mess = noise.
 
 ```powershell
-python ephys_alignment_first.py `
-  --bhv  "C:\data_temp\session1\GlobalLogInt2023-08-15T11_14_10.csv" `
-  --ap   "C:\data_temp\session1\imec0\session_t0.imec0.ap.bin" `
-  --lf   "C:\data_temp\session1\imec0\session_t0.imec0.lf.bin" `
-  --out  "C:\results\session1_imec0" `
-  --feature lfp_deflection `
-  --lfp-mode both `
-  --chunk-sec 60 `
-  --min-candidates 2 `
-  --make-sync
+python feature_explorer.py `
+  --cache "C:\results\session_imec0\*_features_cache.npz" `
+  --bhv   "C:\data_temp\GlobalLogInt*.csv" `
+  --out   "C:\results\session_imec0\explorer_1500_2000" `
+  --tmin 1500 --tmax 2000 `
+  --pre 1.0 --post 2.0
 ```
 
-The cache from Step 1 is detected automatically. The binary files are not re-read.
+Outputs per feature: `erp_<feature>.png` (2×2 grid), `overview_<feature>.png` (full 500 s trace with events), `summary_heatmap.png` (all features × all codes).
+
+---
+
+### Step 4 — Peak audit
+
+`plot_audit.py` detects peaks above a threshold and reports hit rate, false peak rate, and median timing error relative to reward events:
+
+```powershell
+python plot_audit.py `
+  --cache "C:\results\session_imec0\*_features_cache.npz" `
+  --bhv   "C:\data_temp\GlobalLogInt*.csv" `
+  --out   "C:\results\session_imec0\audit_plots" `
+  --threshold 1.5
+```
+
+Threshold guidance: `1.5` for solenoid and AP features; `2.5` for LFP features (after the z-scoring fix that removed `normalize01()`).
+
+---
+
+### Step 5 — Aligned ERP heatmaps
+
+`plot_individual_erps.py` cuts the cache trace into per-trial windows and plots a heatmap (trial × time) plus mean trace. Optionally applies the warp from a sync JSON so behaviour times are mapped to ephys clock before windowing:
+
+```powershell
+python plot_individual_erps.py `
+  --cache  "C:\results\session_imec0\*_features_cache.npz" `
+  --bhv    "C:\data_temp\GlobalLogInt*.csv" `
+  --sync   "C:\results\session_imec0\sync_ephys_*.json" `
+  --out    "C:\results\session_imec0\erp_plots" `
+  --features lfp_block_5_delta,car_block_5_mua_pc1 `
+  --pre 1.0 --post 1.5
+```
+
+Without `--sync`, behaviour times are plotted as-is (clock drift visible as diagonal smearing in the heatmap). With `--sync`, the warp-corrected times are used.
+
+---
+
+## Feature families reference
+
+### Standard features (`ephys_alignment_fusion.py`)
+
+| Cache key | Source | Description |
+|---|---|---|
+| `solenoid_global` | AP | Median across all channels; EM artifact |
+| `solenoid_block` | AP | Median per 32-channel depth block |
+| `solenoid_derivative` | AP | Absolute first-difference of global (sharpest onset) |
+| `lfp_global` | LF | PC1 across all channels, broadband 1–100 Hz |
+| `lfp_block_N` | LF | PC1 of 20-channel depth block N, broadband |
+| `mua_envelope` | AP | RMS envelope 300–3000 Hz, global |
+| `lick_band` | LF | Hilbert envelope of 5–8 Hz band |
+| `sol_depth_N` | AP | Median of depth block N (solenoid by region) |
+
+### Extended features (`extract_extra_features.py`)
+
+| Cache key | Source | Description |
+|---|---|---|
+| `lfp_block_N_<band>_pc{1,2,3}` | LF | PC1/2/3 of block N in band (delta/theta/beta/gamma) |
+| `ap_block_N_<band>_pc{1,2,3}` | AP | PC1/2/3 of block N in band (mua/hfo/gamma) |
+| `tmpl_<code>_<feature>` | cache | Normalised cross-correlation of feature vs mean ERP for event code |
+
+### Advanced features (`extract_better_features.py`)
+
+| Cache key | Source | Description |
+|---|---|---|
+| `rmi_block_N_<band>_topK` | LF | Post/pre reward power ratio for top-K channels (supervised) |
+| `car_block_N_<band>_pc{1,2,3}` | AP | MUA/HFO/gamma envelope after common-average referencing |
+| `sdf_block_N_pc{1,2,3}` | AP | Spike density (threshold-crossing rate) per block |
+| `pac_block_N` | LF | Delta-phase × gamma-amplitude coupling index |
+
+**Frequency bands:**
+
+| Name | Range | Typical signal |
+|---|---|---|
+| `delta` | 1–4 Hz | Slow oscillations, sleep-related activity |
+| `theta` | 4–8 Hz | Licking rhythm, spatial navigation |
+| `beta` | 8–30 Hz | Motor planning, reward anticipation |
+| `gamma` | 30–80 Hz | Local computation, sensory processing |
+| `mua` | 300–3000 Hz | Multiunit spiking activity |
+| `hfo` | 80–200 Hz | High-frequency oscillations |
 
 ---
 
@@ -156,12 +241,15 @@ The cache from Step 1 is detected automatically. The binary files are not re-rea
 
 | File | Contents |
 |---|---|
-| `<stem>_features_cache.npz` | 1-D feature traces + timestamps, saved after extraction |
-| `sync_ephys_<stem>.json` | Warp parameters (`stretch`, `offset`, `rmse`) + per-trial aligned times |
-| `syncfix_ephys_<stem>.mat` | MATLAB-compatible version of the sync JSON |
-| `audit_plots/*.png` | Visual validation plots from `plot_audit.py` |
+| `*_features_cache.npz` | All extracted 1-D feature traces + time axes |
+| `sync_ephys_*.json` | Warp parameters + per-trial aligned times |
+| `syncfix_ephys_*.mat` | MATLAB-compatible version of the sync JSON |
+| `erp_<feature>.png` | 2×2 ERP grid from `feature_explorer.py` |
+| `overview_<feature>.png` | 500 s continuous trace with all event codes |
+| `summary_heatmap.png` | All features × all event codes, ERP score |
+| `audit_plots/*.png` | Peak detection audit from `plot_audit.py` |
 
-### JSON output schema
+### Sync JSON schema
 
 ```json
 {
@@ -180,80 +268,116 @@ The cache from Step 1 is detected automatically. The binary files are not re-rea
     }
   ],
   "metadata": {
-    "features_used": ["lfp_global", "lfp_block_0", "..."],
-    "n_trials": 138,
-    "n_detected": 131
+    "features_used": ["lfp_block_5_delta_pc1"],
+    "n_trials": 336,
+    "n_detected": 310
   }
 }
 ```
 
 ---
 
-## CLI reference — `ephys_alignment_first.py`
+## CLI reference
 
-### Inputs
-
-| Argument | Required | Description |
-|---|---|---|
-| `--bhv` | yes | Behaviour log CSV (`GlobalLog*.csv`) |
-| `--ap` | no | SpikeGLX AP band binary (`*.ap.bin` or `*.ap`) |
-| `--lf` | no | SpikeGLX LF band binary (`*.lf.bin` or `*.lf`) |
-| `--ks` | no | Kilosort output folder |
-| `--gt` | no | Video-pipeline sync JSON for ground-truth comparison |
-| `--out` | no | Output folder (default: same as `--bhv`) |
-
-### Feature selection
-
-| Argument | Default | Choices | Description |
-|---|---|---|---|
-| `--feature` | `all` | `all`, `solenoid_artifact`, `lfp_deflection`, `mua_envelope`, `lick_band` | Which feature to extract and use |
-| `--solenoid-mode` | `global` | `global`, `block`, `derivative`, `all` | Solenoid extraction variant. `all` extracts all three variants and saves each to cache |
-| `--lfp-mode` | `both` | `random`, `global`, `block`, `both` | LFP extraction variant. `both` extracts global + all block traces |
-
-**Solenoid variants:**
-- `global` — median across all channels (common-mode rejection; good for widespread EM interference)
-- `block` — independent median per 32-channel depth block (better spatial localisation)
-- `derivative` — absolute first-difference of the global trace (isolates sharp onset transients; fewest false peaks)
-
-**LFP variants:**
-- `global` — PCA across all 384 channels simultaneously (one trace)
-- `block` — independent PCA per 20-channel block (19 traces, one per region)
-- `both` — saves both global and all block traces to cache
-
-### Alignment
+### `ephys_alignment_fusion.py`
 
 | Argument | Default | Description |
 |---|---|---|
-| `--min-conf` | `0.3` | Minimum confidence to accept an event detection |
-| `--min-candidates` | `2` | Minimum candidates per trial to trust confidence score. Single-candidate trials are rejected (a single weak peak always gets confidence 1.0) |
-| `--train-frac` | `0.8` | Fraction of trials used for warp fitting |
-| `--make-sync` | off | Write `sync_ephys_*.json` and `syncfix_ephys_*.mat` |
-| `--sweep` | off | Run hyperparameter grid search over feature weight combinations |
-
-### Memory and caching
-
-| Argument | Default | Description |
-|---|---|---|
-| `--chunk-sec` | `60.0` | Seconds per loading chunk. Both AP and LF are processed in overlapping windows; reduce to 30 if RAM is tight. 60 s × 384 ch ≈ 200–400 MB per chunk |
-| `--ap-channels` | all neural | Comma-separated AP channel indices to use (e.g. `0,1,2,...,63`). Excludes last channel (sync) by default |
+| `--bhv` | required | Behaviour log CSV |
+| `--ap` | optional | AP binary (`.ap.bin`) |
+| `--lf` | optional | LF binary (`.lf.bin`) |
+| `--out` | required | Output folder |
+| `--feature` | `all` | `all`, `solenoid_artifact`, `lfp_deflection`, `mua_envelope`, `lick_band` |
+| `--solenoid-mode` | `global` | `global`, `block`, `derivative`, `all` |
+| `--lfp-mode` | `both` | `random`, `global`, `block`, `both` |
+| `--chunk-sec` | `60.0` | Seconds per loading chunk |
+| `--ap-channels` | all neural | Comma-separated channel indices (use 24-channel subset to avoid `WinError 8`) |
 | `--lf-channels` | all neural | Comma-separated LF channel indices |
-| `--no-cache` | off | Ignore and overwrite any existing feature cache |
-| `--extract-only` | off | Extract features and save cache, then exit. Use for overnight extraction before analysis |
-| `--analysis-only` | off | Skip binary reading entirely; load from cache and run alignment only |
+| `--min-conf` | `0.3` | Minimum confidence to accept a detection |
+| `--min-candidates` | `2` | Minimum candidates per trial (rejects single-candidate trials) |
+| `--train-frac` | `0.8` | Fraction of trials for warp fitting |
+| `--make-sync` | off | Write sync JSON + MAT |
+| `--no-cache` | off | Ignore existing cache and re-extract |
+| `--extract-only` | off | Extract and cache, then exit |
+| `--analysis-only` | off | Load cache and run alignment only, skip binary reads |
 
----
+### `extract_extra_features.py`
 
-## CLI reference — `plot_audit.py`
+| Argument | Default | Description |
+|---|---|---|
+| `--cache` | required | Existing `.npz` cache to merge into |
+| `--ap` | optional | AP binary |
+| `--lf` | optional | LF binary |
+| `--bhv` | optional | Behaviour CSV (required for templates) |
+| `--bands` | `delta theta beta gamma` | LFP band names |
+| `--ap-bands` | `mua hfo gamma` | AP band names |
+| `--n-pcs` | `3` | PCs to extract per block |
+| `--block-size` | `20` | Channels per depth block |
+| `--chunk-sec` | `60.0` | Seconds per read chunk |
+| `--out-sr` | `1000.0` | Output sample rate (Hz) |
+| `--skip-lfp-bands` | off | Skip LFP band extraction |
+| `--skip-ap-blocks` | off | Skip AP block extraction |
+| `--skip-solenoid-depth` | off | Skip solenoid-by-depth extraction |
+| `--skip-templates` | off | Skip template matching |
 
-| Argument | Required | Default | Description |
-|---|---|---|---|
-| `--cache` | yes | — | Feature cache `.npz` file |
-| `--bhv` | yes | — | Behaviour log CSV |
-| `--out` | no | `<cache_dir>/audit_plots` | Output folder for PNG plots |
-| `--features` | no | `all` | Comma-separated feature names to plot, or `all` |
-| `--threshold` | no | `1.5` | Peak detection threshold in z-scores. Use `2.5` for LFP after z-scoring fix; `1.5` for solenoid |
-| `--min-distance` | no | `0.15` | Minimum distance between peaks (seconds) |
-| `--context-sec` | no | `60.0` | Seconds of context shown around the largest ISI gap in the zoom plot |
+### `extract_better_features.py`
+
+| Argument | Default | Description |
+|---|---|---|
+| `--cache` | required | Existing `.npz` cache |
+| `--ap` | optional | AP binary |
+| `--lf` | optional | LF binary |
+| `--bhv` | optional | Behaviour CSV (required for RMI) |
+| `--block-size` | `20` | Channels per depth block |
+| `--chunk-sec` | `60.0` | Seconds per chunk |
+| `--out-sr` | `1000.0` | Output sample rate |
+| `--n-pcs` | `3` | PCs per block |
+| `--top-k` | `5` | Top-K channels for reward modulation index |
+| `--threshold-sd` | `4.0` | Spike detection threshold (SDF feature) |
+| `--ap-bands` | `mua hfo gamma` | AP bands for CAR-MUA |
+| `--lf-bands` | `delta theta beta gamma` | LFP bands for RMI |
+| `--skip-rmi` | off | Skip reward modulation index |
+| `--skip-car-mua` | off | Skip common-average-referenced MUA |
+| `--skip-sdf` | off | Skip spike density |
+| `--skip-pac` | off | Skip phase-amplitude coupling |
+
+### `feature_explorer.py`
+
+| Argument | Default | Description |
+|---|---|---|
+| `--cache` | required | Feature cache `.npz` |
+| `--bhv` | required | Behaviour CSV |
+| `--out` | `<cache_dir>/explorer_out` | Output folder |
+| `--tmin` | `1500.0` | Start of analysis window (session seconds) |
+| `--tmax` | `2000.0` | End of analysis window |
+| `--pre` | `1.0` | Seconds before event for ERP window |
+| `--post` | `2.0` | Seconds after event |
+| `--features` | `all` | Comma-separated names or `all` |
+| `--skip-overview` | off | Skip continuous overview plots (faster) |
+
+### `plot_audit.py`
+
+| Argument | Default | Description |
+|---|---|---|
+| `--cache` | required | Feature cache `.npz` |
+| `--bhv` | required | Behaviour CSV |
+| `--out` | `<cache_dir>/audit_plots` | Output folder |
+| `--features` | `all` | Feature names or `all` |
+| `--threshold` | `1.5` | Peak detection threshold in z-scores |
+| `--min-distance` | `0.15` | Minimum distance between peaks (seconds) |
+| `--context-sec` | `60.0` | Context around largest ISI gap in zoom plot |
+
+### `plot_individual_erps.py`
+
+| Argument | Default | Description |
+|---|---|---|
+| `--cache` | required | Feature cache `.npz` |
+| `--bhv` | required | Behaviour CSV |
+| `--sync` | optional | Sync JSON for warp-aligned event times |
+| `--out` | `audit_plots_individual_erps` | Output folder |
+| `--features` | `all` | Feature names, `all`, or `better` (only `car_`, `sdf_`, `rmi_`, `pac_` prefixes) |
+| `--pre` | `1.0` | Seconds before event |
+| `--post` | `1.5` | Seconds after event |
 
 ---
 
@@ -261,17 +385,27 @@ The cache from Step 1 is detected automatically. The binary files are not re-rea
 
 ### Memory architecture
 
-Both AP (30 kHz) and LF (2.5 kHz) files are processed in overlapping chunks using `numpy.memmap`. The overlap (0.5 s for AP, 2.0 s for LF) prevents filter-edge artefacts at chunk boundaries. After all chunks are processed, traces are concatenated and z-scored globally across the full session.
+All binary reads use direct file I/O (no `numpy.memmap`) in overlapping mini-batches of 5000 rows × n_channels × 2 bytes ≈ 3.8 MB per mini-batch. This eliminates `[WinError 8] Not enough memory` errors that occurred with `memmap` on machines with limited page file space, regardless of file size.
 
-For a 56-minute session with 384 channels:
-- AP file: ~78 GB on disk, ~200–400 MB per 60-second chunk in RAM
-- LF file: ~7 GB on disk, ~20–40 MB per 60-second chunk in RAM
+For a 78 GB AP file at 30 kHz, 384 channels, 60-second chunks:
+- Old `memmap` approach: 693 MB virtual address reservation per chunk → `WinError 8`
+- New direct-read approach: 3.8 MB peak per mini-batch → always succeeds
+- Using the 24-channel subset: only the selected channels are kept → ~173 MB total per 60 s chunk
+
+### Rolling pipeline pattern for overnight batch runs
+
+Sessions are processed one at a time. Each session script: copies `.bin` + `.meta` files from Dropbox to a local temp folder, runs the Python pipeline, deletes the temp copy. This prevents RAM accumulation across sessions and sidesteps Dropbox file locks:
+
+```powershell
+# Spawns a fresh PowerShell process per session — memory fully reset between sessions
+Start-Process powershell -ArgumentList "-File `".\Session_Script.ps1`"" -Wait -NoNewWindow
+[System.GC]::Collect()
+Start-Sleep -Seconds 30
+```
 
 ### Z-scoring and the "invisible ceiling" fix
 
-Previous versions of the code applied `normalize01()` before z-scoring, clipping signals to the 5th–95th percentile range and bounding output to [0, 1]. This meant z-scores could never exceed ~2.0, causing the detector to miss genuine reward-evoked deflections.
-
-The current code z-scores directly from the median-filtered signal:
+Previous code applied `normalize01()` before z-scoring, clipping signals to [0, 1] and capping z-scores at ≈2. The fix: z-score directly from the smoothed signal:
 
 ```python
 m = np.nanmedian(pc1_smooth)
@@ -279,27 +413,23 @@ s = np.nanstd(pc1_smooth)
 z = (pc1_smooth - m) / s
 ```
 
-Real reward-evoked LFP deflections now reach z = 3–5. Use `--threshold 2.5` for LFP features.
+Reward-evoked LFP deflections now reach z = 3–5. Use `--threshold 2.5` for LFP features.
 
 ### LFP signal direction
 
-The reward-evoked LFP signal is typically a **negative-going** deflection (trough, not peak). The pipeline inverts LFP traces internally before peak-finding so that the trough becomes a detectable positive peak. `plot_audit.py` applies the same inversion automatically for any feature whose name starts with `lfp_`.
+Reward-evoked LFP is a negative-going deflection (trough). All scripts invert traces internally for any feature whose name starts with `lfp_`, so peak-finding works correctly without any extra configuration.
 
 ### Sync channel (channel 384)
 
-The last channel of every SpikeGLX AP and LF file is a digital TTL channel that toggles on every behaviour event recorded in the `GlobalLog`. The pipeline reads this channel automatically and uses it as ground truth to validate alignment quality when present. Sessions where the sync channel is flat or missing fall back to feature-based alignment only.
-
-The ISI-based edge matching algorithm (not sequential index matching) is used to pair sync pulses to behaviour events, making it robust to double-pulses (valve-open + valve-close within 2 seconds are collapsed to one event) and to different absolute time bases.
+The last channel of every SpikeGLX AP file is a digital TTL that toggles on every behaviour event. The pipeline reads this automatically and uses it as ground truth to validate the feature-based warp when present. ISI-based edge matching (not sequential index matching) is used — robust to double-pulses and to different absolute time bases between behaviour and ephys clocks.
 
 ### Warp model
-
-The alignment model is a linear warp fitted with Huber robust regression (scipy `least_squares` with `loss='huber'`), which down-weights outlier trials caused by missed detections or motion artefacts:
 
 ```
 ephys_time = stretch × behavior_time + offset
 ```
 
-Typical values: `stretch` ≈ 1.000 ± 0.001, `offset` ≈ 0.1–0.5 s (hardware delay from state machine to physical reward delivery).
+Fitted with Huber robust regression (`scipy.optimize.least_squares` with `loss='huber'`), which down-weights outlier trials from missed detections. Typical values: `stretch` ≈ 1.000 ± 0.001, `offset` ≈ 0.1–0.5 s.
 
 ---
 
@@ -307,13 +437,15 @@ Typical values: `stretch` ≈ 1.000 ± 0.001, `offset` ≈ 0.1–0.5 s (hardware
 
 | Error | Cause | Fix |
 |---|---|---|
-| `[Errno 22] Invalid argument` | Windows MAX\_PATH limit (>260 chars) or Dropbox lock | Copy data locally with `robocopy`, or map to short drive with `subst Z: "D:\..."` |
-| `Unable to allocate X GiB` | LF/AP file loaded all at once instead of chunked | Should not happen with current code. If it does, reduce `--chunk-sec` to 30 |
-| `need at least one array to concatenate` | AP file is empty (recording aborted) | Check file size. Pipeline now skips empty files gracefully |
-| `vector x must be greater than padlen` | LF file is too short for the bandpass filter | Recording shorter than ~1 second. Nothing to do; session is unusable |
-| `[SYNC] Sync channel present but poor fit` | Sync edges and behaviour events don't match in count or pattern | This session's sync signal is broken — normal, this is exactly the use case for feature-based alignment |
-| `hit_rate=0.000` in plot_audit | Time base mismatch between behaviour (absolute clock) and feature trace (ephys seconds) | `plot_audit.py` subtracts the first timestamp to normalise. Check that bhv CSV is the correct session |
-| Cache loaded but features missing | Previous run crashed before LF extraction finished | Re-run with `--no-cache` to rebuild from scratch |
+| `[Errno 22] Invalid argument` | Windows MAX\_PATH > 260 chars or Dropbox lock | Copy files locally with `robocopy "*.bin" "*.meta"` |
+| `[WinError 8] Not enough memory` | `memmap` exhausted page file | Fixed in current code (direct file I/O). If still occurs, use `--chunk-sec 30` |
+| `cannot reshape array of size 0` | `fh.read()` returned empty bytes | Old `\\?\` path prefix issue — current code uses plain `open()` |
+| `need at least one array to concatenate` | AP/LF file is empty (aborted recording) | Pipeline skips gracefully with a warning |
+| `vector x must be greater than padlen` | File too short for bandpass filter | Recording < 1 s; unusable |
+| `[SYNC] Sync channel present but poor fit` | Sync edges don't match behaviour event count | Expected for corrupted sessions — feature-based alignment proceeds |
+| `hit_rate=0.000` in plot_audit | Time base mismatch | `plot_audit.py` subtracts first timestamp automatically; check CSV is correct session |
+| Cache missing features | Run crashed before LF finished | Re-run with `--no-cache` |
+| `OverflowError: cannot convert float infinity to integer` | Solenoid time array has zero-diff entries → SR = inf | Fixed in `feature_explorer.py` (guards in `infer_sr` + downsampling for high-SR features) |
 
 ---
 
@@ -324,30 +456,29 @@ ephys_data/
 └── 4_Milka/
     └── 15082023_Milka_StrCer_S1_g0/
         ├── 15082023_Milka_StrCer_S1_g0_imec0/
-        │   ├── 15082023_Milka_StrCer_S1_g0_t0.imec0.ap.bin   # 78 GB
-        │   ├── 15082023_Milka_StrCer_S1_g0_t0.imec0.ap.meta
-        │   ├── 15082023_Milka_StrCer_S1_g0_t0.imec0.lf.bin   # 7 GB
-        │   └── 15082023_Milka_StrCer_S1_g0_t0.imec0.lf.meta
+        │   ├── *.ap.bin      # ~78 GB
+        │   ├── *.ap.meta     # required alongside .bin
+        │   ├── *.lf.bin      # ~7 GB
+        │   └── *.lf.meta
         └── 15082023_Milka_StrCer_S1_g0_imec1/
             └── ...
 
 behavior_data/
-└── 4_Milka/
-    └── R1/
-        ├── GlobalLogInt2023-08-15T11_14_10.csv   # behaviour events + codes
-        └── Camera1Timestamp2023-08-15T11_14_10.csv
+└── 4_Milka/R1/
+    └── GlobalLogInt2023-08-15T11_14_10.csv
 
 results/
 └── master_run/
     └── Milka_R1_imec0/
-        ├── 15082023_..._features_cache.npz        # extracted traces (seconds to load)
-        ├── sync_ephys_15082023_...json             # warp + aligned times
-        ├── syncfix_ephys_15082023_...mat           # MATLAB version
-        └── audit_plots/
-            ├── lfp_global_full_session.png
-            ├── lfp_global_zoom_largest_gap.png
-            ├── lfp_global_error_histogram.png
-            └── ...
+        ├── *_features_cache.npz        # all extracted features
+        ├── sync_ephys_*.json
+        ├── syncfix_ephys_*.mat
+        ├── audit_plots/
+        ├── explorer_1500_2000/
+        │   ├── erp_lfp_block_5_delta.png
+        │   ├── overview_lfp_block_5_delta.png
+        │   └── summary_heatmap.png
+        └── erp_plots/
 ```
 
 ---
@@ -355,10 +486,9 @@ results/
 ## Dependencies
 
 ```
-numpy scipy matplotlib pandas scikit-learn scipy.io
+numpy scipy matplotlib pandas scikit-learn
 ```
 
-Install with:
 ```bash
 pip install numpy scipy matplotlib pandas scikit-learn
 ```
