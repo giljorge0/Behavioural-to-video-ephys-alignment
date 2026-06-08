@@ -103,7 +103,14 @@ def infer_sr(times_arr):
     """Estimate sample rate from a time axis array."""
     if times_arr is None or len(times_arr) < 10:
         return 1000.0
-    return float(1.0 / np.median(np.diff(times_arr[:min(10000, len(times_arr))])))
+    diffs = np.diff(times_arr[:min(10000, len(times_arr))])
+    diffs = diffs[diffs > 0]          # remove zero-difference entries
+    if len(diffs) == 0:
+        return 1000.0                  # can't infer — fall back to 1 kHz
+    med = float(np.median(diffs))
+    if med <= 0 or not np.isfinite(med):
+        return 1000.0
+    return 1.0 / med
 
 
 def get_times_for_feature(fname, traces, times, session_dur=None):
@@ -132,22 +139,32 @@ def slice_window(trace, time_arr, tmin, tmax):
     return trace[mask], time_arr[mask]
 
 
-def extract_erp_windows(trace, time_arr, event_times, pre_s=1.0, post_s=2.0):
+def extract_erp_windows(trace, time_arr, event_times,
+                         pre_s=1.0, post_s=2.0, max_sr=2500.0):
     """
     Cut trace into windows around each event.
+    Downsamples to max_sr if the signal sample rate is higher
+    (prevents solenoid/AP features from producing millions of samples).
     Returns (windows array [n_trials × n_samples], time_axis relative to event).
     """
     sr = infer_sr(time_arr)
+
+    # Downsample high-SR traces to keep ERP windows manageable
+    ds = max(1, int(sr / max_sr))
+    if ds > 1:
+        trace    = trace[::ds]
+        time_arr = time_arr[::ds]
+        sr       = sr / ds
+
     pre_n  = int(pre_s * sr)
     post_n = int(post_s * sr)
     n_pts  = pre_n + post_n
 
     windows = []
     for t in event_times:
-        # Find nearest sample
         idx = np.searchsorted(time_arr, t)
-        s = idx - pre_n
-        e = idx + post_n
+        s   = idx - pre_n
+        e   = idx + post_n
         if s >= 0 and e <= len(trace):
             windows.append(trace[s:e])
 
@@ -155,7 +172,18 @@ def extract_erp_windows(trace, time_arr, event_times, pre_s=1.0, post_s=2.0):
         return np.empty((0, n_pts)), np.linspace(-pre_s, post_s, n_pts)
 
     t_axis = np.linspace(-pre_s, post_s, n_pts)
-    return np.vstack(windows), t_axis
+    # Pad/trim any windows that are slightly off due to boundary
+    fixed = []
+    for w in windows:
+        if len(w) == n_pts:
+            fixed.append(w)
+        elif len(w) > n_pts:
+            fixed.append(w[:n_pts])
+        elif len(w) >= n_pts - 2:          # tolerate 1-2 sample rounding
+            fixed.append(np.pad(w, (0, n_pts - len(w))))
+    if not fixed:
+        return np.empty((0, n_pts)), t_axis
+    return np.vstack(fixed), t_axis
 
 
 # ── Plot functions ────────────────────────────────────────────────────────────
@@ -176,7 +204,10 @@ def plot_erp_grid(fname, trace, time_arr, bhv_df, tmin, tmax,
 
     trace_win, time_win = slice_window(trace, time_arr, tmin - pre_s,
                                         tmax + post_s)
-
+    effective_sr = infer_sr(time_win)
+    fig.text(0.01, 0.01, f'SR after ds: {effective_sr:.0f} Hz',
+             fontsize=7, color='gray')
+    
     for ax, code in zip(axes.flat, codes_to_plot):
         label, color = EVENT_CODES.get(code, (f'Code {code}', 'gray'))
 
@@ -372,6 +403,8 @@ def main():
     # ── Select features ────────────────────────────────────────────────────
     if args.features == 'all':
         feat_names = sorted(traces.keys())
+    elif args.features == 'better':
+        feat_names = [f for f in traces.keys() if f.startswith(('car_', 'sdf_', 'rmi_', 'pac_'))]
     else:
         feat_names = [f.strip() for f in args.features.split(',')]
         feat_names = [f for f in feat_names if f in traces]
@@ -382,6 +415,8 @@ def main():
     summary = {}   # fname → {code: score}
 
     for fname in feat_names:
+        if 'sol_depth' in fname:
+            continue
         print(f'  ── {fname}')
         trace    = traces[fname]
         time_arr = get_times_for_feature(fname, traces, times, session_dur=session_dur)
