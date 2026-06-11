@@ -53,8 +53,12 @@ def load_good_units(ks_dir):
         sys.exit(f"[ERROR] cluster_group.tsv not found in {ks_dir}")
     df = pd.read_csv(path, sep="\t")
     df.columns = df.columns.str.strip().str.lower()
-    good = set(df.loc[df["group"].str.strip().str.lower() == "good",
-                      "cluster_id"].astype(int).values)
+    
+    # --- PATCHED LOGIC ---
+    group_col = "group" if "group" in df.columns else "kslabel"
+    good = set(df.loc[df[group_col].astype(str).str.strip().str.lower() == "good", "cluster_id"].astype(int).values)
+    # ---------------------
+    
     print(f"  {len(good)} good units")
     return good
 
