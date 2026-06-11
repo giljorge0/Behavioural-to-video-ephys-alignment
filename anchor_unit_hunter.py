@@ -62,14 +62,15 @@ def load_good_units(ks_dir):
     df = pd.read_csv(path, sep="\t")
     df.columns = df.columns.str.strip().str.lower()
 
-    if "cluster_id" not in df.columns or "group" not in df.columns:
-        sys.exit("[ERROR] cluster_group.tsv must contain columns: cluster_id, group")
+    if "cluster_id" not in df.columns:
+        sys.exit("[ERROR] cluster_group.tsv must contain column: cluster_id")
 
+    group_col = "group" if "group" in df.columns else "kslabel"
     good = set(
-        df.loc[df["group"].astype(str).str.strip().str.lower() == "good", "cluster_id"]
-        .astype(int)
-        .values
-    )
+    df.loc[df[group_col].astype(str).str.strip().str.lower() == "good", "cluster_id"]
+    .astype(int)
+    .values
+)
     print(f"  cluster_group.tsv  → {len(good)} good units")
     return good
 
